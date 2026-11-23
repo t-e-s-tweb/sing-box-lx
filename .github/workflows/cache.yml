@@ -92,8 +92,10 @@ jobs:
           ndk-version: r28c
           local-cache: true
 
-      - name: Setup OpenJDK 17
-        run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless
+      - uses: actions/setup-java@v6
+        with:
+         distribution: temurin
+         java-version: '17'
 
       - name: Resolve version
         id: ver
