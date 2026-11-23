@@ -303,5 +303,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "sing-box-lx ${{ steps.ver.outputs.version }}" \
             --notes-file notes.md \
-            --target "$GITHUB_SHA" \
             $EXTRA
