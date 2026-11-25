@@ -10,6 +10,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -213,17 +214,18 @@ func TestRRSkip_deadMemberKeptButSkipped(t *testing.T) {
 	c := &testDialNode{tag: "c"} // dead, no replacement
 	g := newPoolTestGroup(t, context.Background(), []*testDialNode{a, b, c}, 2)
 	g.balancer.setSlots([]string{"a", "b"})
-	s := &URLTest{outbound: g.outbound, group: g, balancer: g.balancer}
-	s.balancer.alive = s.slotAlive
+	s := &URLTest{outbound: g.outbound, logger: log.NewNOPFactory().NewLogger("test"), group: g, balancer: g.balancer}
+	s.rrWire()
 
-	g.balancePoolFirstLive(context.Background(), 2)
+	g.balancePoolFirstLive(context.Background(), 2, nil)
 	if tags := g.balancer.poolTags(); tags[0] != "a" || tags[1] != "b" {
 		t.Fatalf("dead b must keep its slot, got %v", tags)
 	}
 	picks := func() map[string]int {
 		count := map[string]int{}
 		for i := 0; i < 10; i++ {
-			count[s.selectBalanced(context.Background(), N.NetworkTCP, M.Socksaddr{}).Tag()]++
+			selected, _ := s.selectBalanced(context.Background(), N.NetworkTCP, M.Socksaddr{})
+			count[selected.Tag()]++
 		}
 		return count
 	}
