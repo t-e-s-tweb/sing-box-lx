@@ -63,6 +63,7 @@ jobs:
       - name: Cache Go (modules, build, tools)
         uses: actions/cache@v6
         with:
+          save-always: true
           path: |
             ~/go/pkg/mod
             ~/go/pkg/sumdb
