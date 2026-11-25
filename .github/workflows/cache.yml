@@ -124,6 +124,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v6
         with:
+          save-always: true
           path: |
             ~/go/pkg/mod
             ~/go/pkg/sumdb
