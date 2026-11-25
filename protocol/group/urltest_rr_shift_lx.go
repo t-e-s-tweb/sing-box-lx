@@ -2,37 +2,17 @@ package group
 
 // lx:begin SPEC 138 round_robin: the key shift, the K2 memory, the slot counters
 //
-// The rules named here are those of SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/
-// ALGORITHM.md.
+// The rules are those of SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/ALGORITHM.md: the
+// key shift K1–K5 (§4.4), the slot counters and the quarantine Q1–Q4 (§4.5).
 //
-// The key shift (§4.4). A destination may be unreachable through one live node and
-// reachable through another. The group keeps one number per key, the shift: the
-// key of the table is the sticky key plus the destination (the domain, else the
-// IP) unless the sticky key holds it already; the slot of the key is still counted
-// from the sticky key, (hash + shift) % pool. The key shifts past a node:
-//   - K1: at once by an explicit REFUSE_DST on the slot of the key;
-//   - K2: by the second soft sign (FAIL_NODE, implicit REFUSE_DST, SILENT) of the
-//     key on the node, both picked at the same shift on the slot of the key, the
-//     second started after the outcome of the first, with an ANSWER via the node
-//     between their starts (rrTrack.live) and no ANSWER to the key via the node
-//     that started at or after the first start, also one that came before the
-//     first outcome (rrTrack.keyAnsweredSince). The first sign is only a record in
-//     a table of rrK2Size per group (K4); a shift of the key (the record keeps its
-//     shift), E, the scheduled run and the node leaving the slot erase it, and an
-//     ANSWER to the key on the node makes it void (the cell of the key). Evidence
-//     the group no longer holds gives no shift. A SILENT that gets its ANSWER later
-//     takes back the shift that rested on it.
-// A connection shifts the key only while the shift is still the one it was picked
-// with. A sign on the slot of a retry or of a detour shifts nothing. K5: after |P|
-// shifts in a row with no ANSWER to the key it is marked "address problem": back
-// to its own slot, no K1/K2, no retry by an explicit refusal or LOCAL, until the
-// scheduled run, a manual run or a network change. UDP shifts no key, and without
-// stickiness there is no key.
-//
-// The slot counters (§4.5). Per pool member: connections and the signs counted by
-// Q1, at most once per key (no key: every sign); Q2 quarantines a node that fails
-// noticeably more often than the median of the pool; Q3 halves both counters at
-// 256 connections, and D1 and the node leaving its slot drop them. UDP stays out.
+// How it is kept, per group (rrMemory in the balancer):
+//   - the shift table: rrShiftTableSize keys, the oldest dropped first, read by the
+//     pick under a read lock behind an atomic size; the key of the table is hashed
+//     from the sticky key and the destination without building strings (rrKeyOf);
+//   - the K2 memory: a ring of rrK2Size records with an index; a record is the first
+//     soft sign and the tracker it was taken on (the evidence the group still holds);
+//   - the counters of the slots and strikes(n) under one lock, the quarantine an
+//     atomic copy-on-write set.
 
 import (
 	"context"
@@ -660,27 +640,6 @@ func (m *rrMemory) quarantineLocked(tag string) {
 	delete(m.counts, tag) // the counters of the node start from zero
 }
 
-// rrQuarantine is the quarantine of Q4: the node is no candidate until the
-// scheduled run; its exits are those of Q2.
-func (b *balancer) rrQuarantine(tag string) {
-	m := &b.memory
-	m.access.Lock()
-	defer m.access.Unlock()
-	m.quarantineLocked(tag)
-}
-
-// rrStruck is strikes(n) += 1 of D1 (Q4); it returns the new count.
-func (b *balancer) rrStruck(tag string) int {
-	m := &b.memory
-	m.access.Lock()
-	defer m.access.Unlock()
-	if m.strikes == nil {
-		m.strikes = make(map[string]int)
-	}
-	m.strikes[tag]++
-	return m.strikes[tag]
-}
-
 // rrDropStruck empties, in the plan of the scheduled run, the slots of the nodes
 // struck out (D1) since the run started (§5): the run puts none of them back, its
 // slot stays empty and asks for the replacement search.
@@ -700,13 +659,7 @@ func (b *balancer) rrDropStruck(tags []string) []string {
 // (rrResetMarks) and strikes(n) of Q4 start from zero. It returns the nodes lifted
 // from quarantine: the run probes them (§8 item 19).
 func (b *balancer) rrScheduledRun() []string {
-	var lifted []string
-	if set := b.memory.quarantine.Load(); set != nil {
-		for tag := range *set {
-			lifted = append(lifted, tag)
-		}
-	}
-	b.rrResetMarks()
+	lifted := b.rrResetMarks()
 	m := &b.memory
 	m.access.Lock()
 	m.strikes = nil
@@ -759,8 +712,9 @@ func (b *balancer) rrSlotsChanged() {
 
 // rrResetMarks is the scheduled run, a manual run and a network change: the K5
 // marks and the quarantine lift (a node out of quarantine starts its counters from
-// zero), the K2 memory and the suspicions go (S3). The shifts stay.
-func (b *balancer) rrResetMarks() {
+// zero), the K2 memory and the suspicions go (S3). The shifts stay. It returns the
+// nodes lifted from quarantine.
+func (b *balancer) rrResetMarks() []string {
 	b.memory.shifts.unmarkAll()
 	b.memory.k2.keep(func(string) bool { return false })
 	for _, entry := range b.slotsSnapshot() {
@@ -773,19 +727,35 @@ func (b *balancer) rrResetMarks() {
 	// lock, and a swap between the two would bring a lifted quarantine back.
 	m.access.Lock()
 	defer m.access.Unlock()
+	var lifted []string
 	if set := m.quarantine.Swap(nil); set != nil {
 		for tag := range *set {
 			delete(m.counts, tag)
+			lifted = append(lifted, tag)
 		}
 	}
+	return lifted
 }
 
-// rrForget drops the counters of tag (Q3: D1).
-func (b *balancer) rrForget(tag string) {
+// rrStrikeOut is what D1 does to the memory of the node tag: its counters go (Q3),
+// its K2 records are erased, strikes(n) += 1, and the second D1 since the scheduled
+// run is the quarantine of Q4 when the rest of the pool is not empty (others). It
+// reports the quarantine.
+func (b *balancer) rrStrikeOut(tag string, others bool) bool {
 	m := &b.memory
 	m.access.Lock()
-	defer m.access.Unlock()
 	delete(m.counts, tag)
+	if m.strikes == nil {
+		m.strikes = make(map[string]int)
+	}
+	m.strikes[tag]++
+	quarantined := m.strikes[tag] >= 2 && others
+	if quarantined {
+		m.quarantineLocked(tag) // the node is no candidate until the scheduled run; its exits are those of Q2
+	}
+	m.access.Unlock()
+	m.k2.forget(tag)
+	return quarantined
 }
 
 // rrCreditFail counts a sign of tag by Q1 and reports whether it counted. A node
@@ -879,7 +849,7 @@ func (s *URLTest) rrFirstByte(w *rrConnWatch, c *rrFirstByteConn) {
 	if w.key.valid {
 		b.memory.shifts.answered(w.key.table) // K5: the circle starts anew
 	}
-	if b.heal.grantExtra(now) {
+	if b.heal.grantExtra(now, w.start) {
 		s.rrExtraRound() // W5: one round at once in a pause above the base
 	}
 	if c == nil || c.state.Load()&rrStateSilent == 0 {

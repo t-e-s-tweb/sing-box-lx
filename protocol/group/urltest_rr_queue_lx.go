@@ -2,23 +2,13 @@ package group
 
 // lx:begin SPEC 138 round_robin: the probe queue of a core instance (§4.7)
 //
-// The rules named here are those of SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/
-// ALGORITHM.md. One queue per core instance, shared by every round_robin group of
-// it: at most rrQueueCap (U) self-heal probes in flight — the checks, the
-// replacement searches and the life probes. The scheduled run stays outside, it has
-// its own limit. The queue only orders and paces: no inference is made in it, the
-// pauses (W), the quarantine and the counts stay with the group.
-//   - U1: a group asks for a batch of places and gets all of them at once; a batch
-//     larger than U is asked for in parts (rrCheck.acquire).
-//   - U2: the groups waiting are served in turn, one batch each.
-//   - U3: one probe per node (leaf and URL) in flight per core. A probe asked for
-//     while one of the same node flies takes its outcome when that one started not
-//     earlier than the lower bound of the rule asking; otherwise it waits for its
-//     end and starts its own. The place of the asker is held all along. A flight
-//     whose askers all gave up is cancelled and leaves the table at once: nobody
-//     joins a cancelled probe, and a cancelled probe is no outcome (rrProbe.cancelled).
-//     The decisive probe of a node whose own first probe still flies does not wait
-//     for it and flies beside it (rrCheck.launch).
+// The rules are those of SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/ALGORITHM.md §4.7
+// (U1–U3). One queue per core instance, shared by every round_robin group of it; the
+// scheduled run stays outside. The queue only orders and paces: no inference is made
+// in it. A request larger than U is asked for in parts (rrCheck.launchAll). A flight
+// whose askers all gave up is cancelled and leaves the table at once, so nobody joins
+// a cancelled probe; the decisive probe of a node whose own first probe still flies
+// flies beside it (rrCheck.launch).
 //
 // The core instance is the owner of the shared URL test history: the queue is kept
 // by a weak pointer to the history storage and dropped with it, so two instances
@@ -101,8 +91,17 @@ func rrQueueOf(history *urltest.HistoryStorage) *rrQueue {
 
 // acquire waits for places of owner (U1, U2); false when ctx ended first.
 func (q *rrQueue) acquire(ctx context.Context, owner *rrQueueOwner, places int) bool {
+	return q.await(ctx, owner, q.enqueue(owner, places))
+}
+
+// enqueue puts a request for places of owner in its line at once: the batches of a
+// group are granted in the order the group put them (U1, U2). A part of the
+// decisive probes asked for after the first probes of a pool larger than U must
+// not overtake them: its places would wait for the first probes of its own nodes,
+// which would wait for its places. nil: nothing to wait for.
+func (q *rrQueue) enqueue(owner *rrQueueOwner, places int) *rrQueueRequest {
 	if places <= 0 {
-		return true
+		return nil
 	}
 	if places > rrQueueCap {
 		places = rrQueueCap
@@ -116,6 +115,15 @@ func (q *rrQueue) acquire(ctx context.Context, owner *rrQueueOwner, places int) 
 	}
 	q.dispatch()
 	q.access.Unlock()
+	return request
+}
+
+// await waits for the places of request (enqueue); false when ctx ended first,
+// with the request out of the line or its granted places given back.
+func (q *rrQueue) await(ctx context.Context, owner *rrQueueOwner, request *rrQueueRequest) bool {
+	if request == nil {
+		return true
+	}
 	select {
 	case <-request.granted:
 		return true
@@ -124,7 +132,7 @@ func (q *rrQueue) acquire(ctx context.Context, owner *rrQueueOwner, places int) 
 	q.access.Lock()
 	defer q.access.Unlock()
 	if request.ok {
-		q.held -= places
+		q.held -= request.places
 		q.dispatch()
 		return false
 	}

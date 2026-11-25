@@ -6,7 +6,10 @@
 
 package group
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // roundBusy reports a round of the group in flight.
 func (h *rrHeal) roundBusy() bool {
@@ -68,24 +71,47 @@ func (h *rrHeal) clearPause() { h.setPauseEnd(nil) }
 func (h *rrHeal) pauseStep() int32 {
 	h.access.Lock()
 	defer h.access.Unlock()
-	return h.step
+	return h.step.Load()
 }
 
 // setPauseStep sets the step of the pause.
 func (h *rrHeal) setPauseStep(step int32) {
 	h.access.Lock()
 	defer h.access.Unlock()
-	h.step = step
+	h.step.Store(step)
 }
 
 // pollCount returns o.
 func (h *rrHeal) pollCount() int32 { return int32(h.polls()) }
 
-// setPollCount sets o.
+// setPollCount sets o to polled tags that name no node.
 func (h *rrHeal) setPollCount(polled int32) {
 	h.access.Lock()
 	defer h.access.Unlock()
-	h.polled = polled
+	h.polled = make(map[string]struct{}, polled)
+	for i := range polled {
+		h.polled[fmt.Sprint("polled-", i)] = struct{}{}
+	}
+}
+
+// rrQuarantine puts tag in quarantine as Q4 does.
+func (b *balancer) rrQuarantine(tag string) {
+	m := &b.memory
+	m.access.Lock()
+	defer m.access.Unlock()
+	m.quarantineLocked(tag)
+}
+
+// rrStruck is strikes(n) += 1 of D1 alone; it returns the new count.
+func (b *balancer) rrStruck(tag string) int {
+	m := &b.memory
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.strikes == nil {
+		m.strikes = make(map[string]int)
+	}
+	m.strikes[tag]++
+	return m.strikes[tag]
 }
 
 // inFlight returns the places of the queue held.

@@ -479,6 +479,9 @@ func TestRRAlgo_S2_openTimeout(t *testing.T) {
 	f := newHealFixture(t, []string{"a", "b", "c"}, []string{"a", "b", "c"}, 0)
 	f.s.balancer.heal.holdRound()
 	defer f.s.balancer.heal.dropRound()
+	// The probe the failed open starts through a gets no answer while the rule is read.
+	f.nodes["a"].hold = make(chan struct{})
+	defer close(f.nodes["a"].hold)
 	destination := siteAddr("site.example")
 	start := time.Now().Add(-6 * time.Second)
 	timeout := os.ErrDeadlineExceeded
@@ -545,7 +548,7 @@ func TestSiteOnOpen_destinationDialer(t *testing.T) {
 	if g.pathDead(node, syscall.ECONNREFUSED) {
 		t.Fatal("SPEC 054: its refused open is no dead path")
 	}
-	s := &URLTest{outbound: manager, group: g, balancer: &balancer{}}
+	s := &URLTest{outbound: manager, group: g, lxURLTest: lxURLTest{balancer: &balancer{}}}
 	if s.rrOutcome(node, syscall.ECONNREFUSED) != rrRefused || s.rrOutcome(node, io.EOF) != rrFailActive {
 		t.Fatal("refused or reset at a leaf that goes to the site: explicit REFUSE_DST; anything else FAIL_NODE")
 	}

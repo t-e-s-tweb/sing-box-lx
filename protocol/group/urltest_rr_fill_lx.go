@@ -10,8 +10,10 @@ package group
 // probe takes a slot whose node is dead (no history) or empty at once, through the
 // same point write as a self-heal replacement (balancer.replaceSlot): no node in two
 // slots, a live slot is never touched, a quarantined node takes none. The run's own
-// plan at its end (balancePoolFirstLive, balancePoolTolerant, rebuildPool) still
-// sets the pool in its order — with pool_tolerance > 0 sorted by delay.
+// plan at its end (balancePoolFirstLive, balancePoolTolerant, rebuildPool) goes from
+// the slots as they stand then: a node that took a slot here keeps it (SPEC 138 §5,
+// I5), only empty and dead slots fill; with pool_tolerance > 0 a live slot changes
+// its node only for one faster by more than the tolerance.
 
 import (
 	"context"
@@ -20,13 +22,13 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// onProbeAliveLx is the hook of a probe that answered (urlTestBatch.onAlive): the
+// onProbeAliveLx is the hook of a probe that answered (probeAliveLx, urltest_hooks_lx.go): the
 // SPEC 054 proof of life, the SPEC 138 proof of the path (rrRunAnswer), and the
 // SPEC 019 fill of a dead slot.
 func (g *URLTestGroup) onProbeAliveLx(tag string) {
 	g.penaltyReset(tag)
-	if g.balancer != nil && g.balancer.onRunAnswer != nil {
-		g.balancer.onRunAnswer(tag)
+	if g.balancer != nil && g.balancer.rr != nil {
+		g.balancer.rr.rrRunAnswer(tag)
 	}
 	g.rrFillOnAlive(tag)
 }
@@ -66,15 +68,12 @@ func (g *URLTestGroup) rrFillOnAlive(tag string) {
 	}
 }
 
-// rrPoolReserveMin is the floor of the reserve of the lazy run (R10).
-const rrPoolReserveMin = 1
-
 // rrPoolReserve is the reserve of the lazy run of a pool of size slots: live nodes
-// beyond the pool the run walks to, ceil(size/2) and at least rrPoolReserveMin.
+// beyond the pool the run walks to, ceil(size/2) and at least 1.
 // They take no slot: their fresh history puts them first in a replacement search
 // (SPEC 138 §5); a candidate still takes a slot only by its own probe.
 func rrPoolReserve(size int) int {
-	return max((size+1)/2, rrPoolReserveMin)
+	return max((size+1)/2, 1)
 }
 
 // rrProbeLifted probes the nodes the scheduled run lifted from quarantine (SPEC 138

@@ -2,46 +2,24 @@ package group
 
 // lx:begin SPEC 138 round_robin self-heal: outcomes, the retry, the check and the replacement
 //
-// The rules named here are those of SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/
-// ALGORITHM.md.
+// The rules are those of SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/ALGORITHM.md: the
+// classes of a failed open (§2), the retry and the replacement (§5), the rounds —
+// the check of the pool and the replacement search (§4.2) — and their pause (§4.6).
 //
-// A failed open of a round_robin connection is classified (§2): CANCEL (the client
-// or the group gave up: nothing follows), LOCAL, an explicit REFUSE_DST (a code of
-// the node's own leaf; a refused or reset open of a leaf that goes to the site
-// itself), FAIL_NODE by an active refusal or by a timeout. It is retried once
-// through another slot of the pool whose leaf is no nested urltest, the next one
-// with no suspicion first, else the next one under suspicion (§5); a key marked by
-// K5 keeps only the retry of FAIL_NODE. In a freeze (N0) the retry stays and nothing
-// else: the open and the retry began before E and go to no rule. The sign then
-// goes to its rules: S1 (a fast refusal: the life probe, the bypass only after it
-// failed), S2 (a timeout: the bypass and the life probe at once), K1 (the key
-// shifts at once), K2/K4 (the memory of a soft sign) and Q1 (the count).
-//
-// A round (§4.2) is a check of the pool or a replacement search; one at a time per
-// group, the next one not earlier than the pause after the previous one (§4.6): 15 s,
-// doubled up to 120 s after a round with no ANSWER at a lap of the cursor, back to
-// 15 s at the ANSWER of any probe of the group and at N3; the first byte of a
-// connection in a pause above the base gives one round at once (W5). Every probe
-// takes its place in the queue of the core (urltest_rr_queue_lx.go, §4.7).
-//
-// The check is started only by a soft sign on a pool node and judges the whole
-// pool: the first probes of every node; after H with no answer the candidates in
-// batches of the pool size, at most k batches (rrCandidateBatches); the first
-// ANSWER is the control; a node that has not answered gets its decisive probe when
-// its first probe ended with no ANSWER or flew H, in parts of up to U − 1 nodes,
-// and a part with a decisive probe with no ANSWER gets one control after. D1
-// strikes a node out and empties its slot, D3 writes the answer, D4/D5 end with no
-// verdict and no event. The search is started by an empty slot or the slot of a
-// quarantined node: candidates only, no pool node, no control; a candidate takes
-// the slot by the ANSWER of its own probe (§5). Only one writer changes the slots at
-// a time, under the flag of the scheduled run (URLTestGroup.checking), taken for the
-// write of a slot only, never for the probes of a round: while a run holds it, the
-// run fills the slots itself, and a run or a manual test is never skipped for a round.
+// How it is kept:
+//   - rrHeal lives in the balancer; one lock (rrHeal.access) guards the round in
+//     flight and the pause, E is an atomic read on the hot path;
+//   - a round runs in its own goroutine (rrCheck) on a context the group's Close
+//     and an event cancel; only that goroutine touches the rrCheck and the cursor;
+//   - every probe takes its place in the queue of the core (urltest_rr_queue_lx.go);
+//   - the slots are written by one writer at a time under the flag of the run
+//     (URLTestGroup.checking), taken for the write of a slot only (rrWriteSlot).
 //
 // A connection test (SPEC 139, lxtrace.IsProbe) gets the retry and records nothing;
 // a delay measurement through the group (urltest.IsMeasureLx) gets nothing.
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"math"
@@ -68,9 +46,6 @@ const (
 	rrPauseSteps = 3
 	// rrHealFreeze — the freeze of an event, N3 (T).
 	rrHealFreeze = 15 * time.Second
-	// rrHealYieldWait bounds how long the full run after a network change waits for
-	// the aborted check to end.
-	rrHealYieldWait = C.TCPTimeout
 	// rrCandidateBatches is k: batches of candidates per round, the replacement of a
 	// check included (L3).
 	rrCandidateBatches = 2
@@ -80,11 +55,11 @@ const (
 type rrHeal struct {
 	// access guards the round in flight and the pause of rounds (§4.6).
 	access sync.Mutex
-	round  *rrRound   // the round in flight (a check or a search); nil for none
-	end    *time.Time // e, the end of the previous round (W1); nil: no pause
-	step   int32      // g = rrHealGap << step (W2)
-	polled int32      // o, the candidates the cursor gave since the last ANSWER of a probe of the group
-	right  rrRight    // xr of the pause that ends at end (W5)
+	round  *rrRound            // the round in flight (a check or a search); nil for none
+	end    *time.Time          // e, the end of the previous round (W1); nil: no pause
+	step   atomic.Int32        // g = rrHealGap << step (W2); written under access, read without it by grantExtra
+	polled map[string]struct{} // o, the candidates polled since the last ANSWER of a probe of the group, each once
+	right  rrRight             // xr of the pause that ends at end (W5)
 	// epochEnd is E, the rrClock of the end of the last freeze (N0): while now < E
 	// nothing is inferred or done, and an exchange that started before E takes part
 	// in no rule. 0: no event yet (epoch reads it as math.MinInt64).
@@ -149,7 +124,7 @@ func (h *rrHeal) liveHistory(leaf string, history *adapter.URLTestHistory) bool 
 func (h *rrHeal) pause() time.Duration {
 	h.access.Lock()
 	defer h.access.Unlock()
-	return rrHealGap << h.step
+	return rrHealGap << h.step.Load()
 }
 
 // pausing reports, at now, whether the pause after the last round still holds.
@@ -160,7 +135,7 @@ func (h *rrHeal) pausing(now time.Time) bool {
 }
 
 func (h *rrHeal) pausingLocked(now time.Time) bool {
-	return h.end != nil && now.Sub(*h.end) < rrHealGap<<h.step
+	return h.end != nil && now.Sub(*h.end) < rrHealGap<<h.step.Load()
 }
 
 // lifeHeld is W4: while the step of the pause is above the base and the pause goes
@@ -168,7 +143,7 @@ func (h *rrHeal) pausingLocked(now time.Time) bool {
 func (h *rrHeal) lifeHeld(now time.Time) bool {
 	h.access.Lock()
 	defer h.access.Unlock()
-	return h.step > 0 && h.pausingLocked(now)
+	return h.step.Load() > 0 && h.pausingLocked(now)
 }
 
 // ready reports whether a round could start at now: none in flight, not frozen, the
@@ -224,8 +199,8 @@ func (h *rrHeal) endRound(now time.Time, probed, answered, lap bool) {
 		}
 	case h.frozen():
 	case !extra || answered:
-		if !answered && lap && h.step < rrPauseSteps {
-			h.step++
+		if !answered && lap && h.step.Load() < rrPauseSteps {
+			h.step.Add(1)
 		}
 		h.end, h.right = &now, rrRightNone
 	}
@@ -249,29 +224,52 @@ func (h *rrHeal) running(cancel context.CancelFunc) {
 func (h *rrHeal) probeAnswered() {
 	h.access.Lock()
 	defer h.access.Unlock()
-	h.step, h.polled = 0, 0
+	h.step.Store(0)
+	h.polled = nil
 }
 
-// poll counts a candidate the cursor gave (o).
-func (h *rrHeal) poll() {
+// poll adds a candidate given to a batch to o, whether the cursor gave it or its
+// live history put it first (§4.6).
+func (h *rrHeal) poll(tag string) {
 	h.access.Lock()
 	defer h.access.Unlock()
-	h.polled++
+	if h.polled == nil {
+		h.polled = make(map[string]struct{})
+	}
+	h.polled[tag] = struct{}{}
 }
 
-// polls returns o.
+// polls returns |o|.
 func (h *rrHeal) polls() int {
 	h.access.Lock()
 	defer h.access.Unlock()
-	return int(h.polled)
+	return len(h.polled)
 }
 
-// grantExtra is W5: an ANSWER of a connection of the group during a pause above
-// the base gives one round at once, once per pause. It reports a new right.
-func (h *rrHeal) grantExtra(now time.Time) bool {
+// polledAll reports whether o holds every one of tags: lap (§4.6).
+func (h *rrHeal) polledAll(tags []string) bool {
 	h.access.Lock()
 	defer h.access.Unlock()
-	if h.step == 0 || !h.pausingLocked(now) || h.right != rrRightNone {
+	for _, tag := range tags {
+		if _, polled := h.polled[tag]; !polled {
+			return false
+		}
+	}
+	return true
+}
+
+// grantExtra is W5: an ANSWER of a connection of the group picked during a pause
+// above the base gives one round at once, once per pause. A connection picked
+// before the pause began ran during the round: its answer is no news of the time
+// after it (the pick that started a search gave a second probe of the same
+// candidates at once). It reports a new right.
+func (h *rrHeal) grantExtra(now, picked time.Time) bool {
+	if h.step.Load() == 0 {
+		return false // the hot path: the first byte of every watched connection
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	if h.step.Load() == 0 || !h.pausingLocked(now) || h.right != rrRightNone || picked.Before(*h.end) {
 		return false
 	}
 	h.right = rrRightOpen
@@ -298,7 +296,8 @@ func (h *rrHeal) freeze() {
 		}
 	}
 	h.access.Lock()
-	h.end, h.step, h.right = nil, 0, rrRightNone
+	h.end, h.right = nil, rrRightNone
+	h.step.Store(0)
 	h.access.Unlock()
 	h.lifeAccess.Lock()
 	h.lifeStarts, h.udpLifeLast = [rrLifeBurst]int64{}, 0
@@ -336,7 +335,8 @@ func (h *rrHeal) aborted(ctx context.Context) bool {
 	return ctx.Err() != nil || h.frozen()
 }
 
-// yield waits, at most rrHealYieldWait, for the round in flight to end.
+// yield waits, at most C.TCPTimeout, for the round in flight to end: the full run
+// after a network change waits so for the aborted check.
 func (h *rrHeal) yield(ctx context.Context) {
 	h.access.Lock()
 	var done chan struct{}
@@ -347,7 +347,7 @@ func (h *rrHeal) yield(ctx context.Context) {
 	if done == nil {
 		return
 	}
-	timer := time.NewTimer(rrHealYieldWait)
+	timer := time.NewTimer(C.TCPTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
@@ -914,13 +914,17 @@ type rrCheck struct {
 }
 
 // request asks the queue for n places and hands then to the loop once they are
-// granted (U1); with the round over it gets nothing to do.
+// granted (U1); with the round over it gets nothing to do. The request takes its
+// place in the line here, in the order of the calls (U1, U2: rrQueue.enqueue); only
+// the wait for the grant runs aside.
 func (c *rrCheck) request(n int, then func()) {
 	c.flying++
 	c.requests.Add(1)
+	owner := &c.s.balancer.heal.queue
+	queued := c.queue.enqueue(owner, n)
 	go func() {
 		defer c.requests.Done()
-		if !c.queue.acquire(c.ctx, &c.s.balancer.heal.queue, n) {
+		if !c.queue.await(c.ctx, owner, queued) {
 			c.grants <- func() {}
 			return
 		}
@@ -1271,18 +1275,16 @@ func (s *URLTest) rrHealSearch() {
 	})
 }
 
-// rrLap is lap (§4.6): the cursor gave as many candidates as C holds for it since
-// the last ANSWER of a probe of the group, or C holds none.
+// rrLap is lap (§4.6): every candidate of C was polled since the last ANSWER of a
+// probe of the group — by the cursor or first by its live history — or C holds none.
 func (s *URLTest) rrLap() bool {
-	g, b := s.group, s.balancer
-	walk := 0
-	for _, node := range g.outbounds {
-		if !s.rrCandidate(node) || s.rrLiveHistory(node) != nil {
-			continue // in the pool, out of reach, or polled first by its live history (§5)
+	var candidates []string
+	for _, node := range s.group.outbounds {
+		if s.rrCandidate(node) {
+			candidates = append(candidates, node.Tag())
 		}
-		walk++
 	}
-	return b.heal.polls() >= walk
+	return s.balancer.heal.polledAll(candidates)
 }
 
 // rrStrike is D1 for every pool node whose decisive probe had no ANSWER while the
@@ -1307,13 +1309,11 @@ func (s *URLTest) rrStrike(ctx context.Context, c *rrCheck) {
 			continue // D1: a scheduled run answered for the node since x, no verdict
 		}
 		others := s.rrPoolOthers(node.Tag())
-		b.rrForget(node.Tag())         // Q3: D1 drops the counters
-		b.memory.k2.forget(node.Tag()) // K2: D1 erases the node's records
-		s.rrDead(t)
-		b.clearSlot(node.Tag())
+		s.rrDead(t)             // before the slot empties: a dial in flight either still finds its slot or is marked struck (its retry)
+		b.clearSlot(node.Tag()) // R1
+		quarantined := b.rrStrikeOut(node.Tag(), others)
 		s.logger.Info("round_robin: ", node.Tag(), " struck out as dead; control ", c.control.Tag())
-		if b.rrStruck(node.Tag()) >= 2 && others {
-			b.rrQuarantine(node.Tag()) // Q4: the second D1 since the scheduled run
+		if quarantined {
 			s.logger.Info("round_robin: ", node.Tag(), " quarantined: struck out twice since the scheduled run")
 		}
 	}
@@ -1360,18 +1360,11 @@ func (s *URLTest) rrRefill(ctx context.Context, c *rrCheck) {
 				return // a run holds the flag (the run fills the slots itself), or the round is over
 			}
 			if replaced {
-				s.logger.Info("round_robin: ", node.Tag(), " takes the slot of ", rrSlotName(dead))
+				s.logger.Info("round_robin: ", node.Tag(), " takes the slot of ", cmp.Or(dead, "a struck node"))
 				break
 			}
 		}
 	}
-}
-
-func rrSlotName(tag string) string {
-	if tag == "" {
-		return "a struck node"
-	}
-	return tag
 }
 
 // rrLiveHistory returns the history of the leaf of node when it is live (§5), else
@@ -1387,7 +1380,7 @@ func (s *URLTest) rrLiveHistory(node adapter.Outbound) *adapter.URLTestHistory {
 // rrCandidateBatch returns the next batch of at most size candidates not yet probed
 // in this round (§5): those with live history first, fastest first, then the rest
 // from the cursor going round in config order; the cursor moves past the last one
-// it gave (I8), and o counts the ones it gave (§4.6).
+// it gave (I8), and o takes every one given, either way (§4.6).
 func (s *URLTest) rrCandidateBatch(seen map[string]bool, size int) []adapter.Outbound {
 	g, b := s.group, s.balancer
 	usable := func(node adapter.Outbound) bool {
@@ -1412,6 +1405,7 @@ func (s *URLTest) rrCandidateBatch(seen map[string]bool, size int) []adapter.Out
 		}
 		batch = append(batch, byTag[entry.tag])
 		seen[entry.tag] = true
+		b.heal.poll(entry.tag) // o: polled first by its live history, the cursor stays (I8)
 	}
 	n := len(g.outbounds)
 	from := b.heal.cursor // I8: the walk goes from where the cursor stood; it moves past each one given
@@ -1424,7 +1418,7 @@ func (s *URLTest) rrCandidateBatch(seen map[string]bool, size int) []adapter.Out
 		batch = append(batch, node)
 		seen[node.Tag()] = true
 		b.heal.cursor = (i + 1) % n
-		b.heal.poll()
+		b.heal.poll(node.Tag())
 	}
 	return batch
 }

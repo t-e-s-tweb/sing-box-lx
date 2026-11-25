@@ -85,11 +85,11 @@ func TestRR9_W5_oneExtraRoundPerPause(t *testing.T) {
 	at := time.Now()
 	h.beginRound(at)
 	h.endRound(at, true, false, false)
-	if h.grantExtra(at.Add(time.Second)) {
+	if h.grantExtra(at.Add(time.Second), at.Add(time.Second)) {
 		t.Fatal("W5: no right at the base")
 	}
 	h.setPauseStep(2)
-	if !h.grantExtra(at.Add(time.Second)) || h.grantExtra(at.Add(2*time.Second)) {
+	if !h.grantExtra(at.Add(time.Second), at.Add(time.Second)) || h.grantExtra(at.Add(2*time.Second), at.Add(2*time.Second)) {
 		t.Fatal("W5: one right per pause")
 	}
 	end := h.pauseEnd()
@@ -100,7 +100,7 @@ func TestRR9_W5_oneExtraRoundPerPause(t *testing.T) {
 	if h.pauseEnd() != end || h.pauseStep() != 2 {
 		t.Fatal("W5: the round of the right with no ANSWER keeps the step and the end of the pause")
 	}
-	if h.ready(at.Add(4*time.Second)) || h.grantExtra(at.Add(5*time.Second)) {
+	if h.ready(at.Add(4*time.Second)) || h.grantExtra(at.Add(5*time.Second), at.Add(5*time.Second)) {
 		t.Fatal("W5: the second first byte of the same pause gives no round")
 	}
 	if !h.ready(at.Add(h.pause())) {
@@ -128,6 +128,37 @@ func TestRR9_W4_lifeProbeWaitsForThePause(t *testing.T) {
 }
 
 // --- U: the probe queue of the core --------------------------------------------------
+
+// U1, U2: the batches of a round are granted in the order the round asked for them:
+// a part of decisive probes asked for after the first probes of a pool larger than
+// U never overtakes them (its places would wait for those first probes, which
+// would wait for its places).
+func TestRR9_U_requestsKeepTheirOrder(t *testing.T) {
+	f := newHealFixture(t, []string{"a"}, []string{"a"}, 0)
+	q := &rrQueue{flights: make(map[rrFlightKey]*rrFlight)}
+	ctx := context.Background()
+	var other rrQueueOwner
+	if !q.acquire(ctx, &other, rrQueueCap) {
+		t.Fatal("precondition: the queue is full")
+	}
+	const n = 8
+	c := &rrCheck{s: f.s, ctx: ctx, queue: q, grants: make(chan func(), n)}
+	var order []int
+	for i := range n {
+		c.request(rrQueueCap, func() { order = append(order, i) })
+	}
+	for range n {
+		q.release(rrQueueCap) // the places of the batch before: the next one is granted
+		(<-c.grants)()
+	}
+	q.release(rrQueueCap)
+	c.requests.Wait()
+	for i, got := range order {
+		if got != i {
+			t.Fatalf("the batches were granted out of the order asked: %v", order)
+		}
+	}
+}
 
 // U1, U2: at most U places held; a batch is granted whole; the groups waiting are
 // served in turn, one batch each.
@@ -360,7 +391,7 @@ func virtualRounds(f *healFixture, origin time.Time, from, to int, firstBytes bo
 			}
 		}
 		if firstBytes {
-			heal.grantExtra(at)
+			heal.grantExtra(at, at)
 		}
 		if !heal.beginRound(at) {
 			continue
