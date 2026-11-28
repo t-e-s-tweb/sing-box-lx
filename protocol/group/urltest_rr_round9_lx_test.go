@@ -152,7 +152,6 @@ func TestRR9_U_requestsKeepTheirOrder(t *testing.T) {
 		(<-c.grants)()
 	}
 	q.release(rrQueueCap)
-	c.requests.Wait()
 	for i, got := range order {
 		if got != i {
 			t.Fatalf("the batches were granted out of the order asked: %v", order)
@@ -523,7 +522,7 @@ func TestRR9_L3_fiveGroupsCoreBound(t *testing.T) {
 	}
 	start := time.Now()
 	for _, f := range fixtures {
-		if !f.s.rrStartCheck() {
+		if !f.s.rrStartRound(f.s.rrHealCheck) {
 			t.Fatal("precondition: the checks start")
 		}
 	}

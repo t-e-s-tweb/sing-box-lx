@@ -7,7 +7,7 @@
 [![Go toolchain](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white)](go.version)
 [![License: GPL-3.0](https://img.shields.io/github/license/Leadaxe/sing-box-lx)](LICENSE)
 
-**sing-box-lx is a client core based on [sing-box](https://github.com/SagerNet/sing-box) for desktop, Android and routers, compatible with current Xray and AmneziaWG servers.** The fork adds what those servers ask of a client: REALITY with the post-quantum key share, the XHTTP transport and VLESS `encryption` from Xray, AmneziaWG 2.0 / 3.x on the WireGuard endpoint, Cloudflare WARP over MASQUE, and TrustTunnel. Around the protocols it adds what apps and OpenWrt routers need to run a core: the `lxd` daemon, a gRPC state API, sleep for idle tunnels.
+**sing-box-lx is an extended client proxy and VPN core based on [sing-box](https://github.com/SagerNet/sing-box) for desktop, Android and routers, compatible with current Xray and AmneziaWG servers.** The fork adds what those servers ask of a client: REALITY with the post-quantum key share, the XHTTP transport and VLESS `encryption` from Xray, AmneziaWG 2.0 / 3.x on the WireGuard endpoint, Cloudflare WARP over MASQUE, and TrustTunnel. Around the protocols it adds what apps and OpenWrt routers need to run a core: the `lxd` daemon, a gRPC state API, sleep for idle tunnels.
 
 It is a drop-in: the binary is still `sing-box`, the config is still sing-box JSON, and `-lx` appears only in the version string. Every `upstream/stable` release is merged; a build without the fork's tags and a config without its fields behave as upstream, byte for byte.
 
@@ -19,8 +19,10 @@ The project is free and developed in spare time — **[support it](docs-lx/donat
 - **WireGuard gets through a network that drops it by signature.** AmneziaWG changes the shape of the packets, and the masquerade keys put a browser's QUIC Initial ahead of the handshake. → [AmneziaWG](#amneziawg-20-and-3x-run-on-the-standard-wireguard-endpoint)
 - **Cloudflare WARP connects where UDP 443 is filtered.** The `masque` outbound carries the tunnel over HTTP/3 or over HTTP/2 on TCP 443. → [MASQUE](#cloudflare-warp-connects-over-masque-on-http3-or-http2)
 - **A phone with ten WireGuard nodes stops paying for nine idle ones.** Idle endpoints go to sleep: on a device, eight sleeping endpoints freed 134 MB. → [Idle-suspend](#idle-wireguard-tunnels-sleep-on-android)
-- **A router serves VPN on a separate SSID and survives a broken config.** The `lxd` daemon applies a config, rolls back if the core does not start, and stays reachable meanwhile. → [`lxd`](#the-lxd-daemon-keeps-its-control-channel-through-every-config-change)
-- **An app shows what the core is doing without parsing logs.** Groups, pools, chains, rules, DNS queries and per-connection paths come over gRPC. → [Observability](#apps-read-the-cores-state-over-grpc)
+- **A router serves VPN on a separate SSID and rolls back if a config breaks it.** The `lxd` daemon checks a config before the swap and returns to the last one that worked if the core does not start; the control channel stays up all the while. → [`lxd`](#the-lxd-daemon-keeps-its-control-channel-through-every-config-change)
+- **An app shows what the core is doing without parsing logs.** Groups, pools, chains, rules, DNS queries and per-connection paths come over gRPC. → [Observability](#observability-over-grpc-the-app-sees-what-the-core-is-doing)
+- **A pool server that goes down drops no requests.** The `round_robin` load balancer retries the connection through a neighbouring node and replaces the dead node with a live one from the reserve without waiting for a check. → [`urltest`](#urltest-balances-across-a-pool-or-holds-one-node-until-it-fails)
+- **Balancing, failover and transports are tested on a bad network without root.** The `impair` outbound degrades the link inside the core under control: rate, loss, scheduled outages, the same run again by `seed`. → [Network impairment](#network-impairment-without-root-a-controlled-bad-link-inside-the-core)
 
 ## Download and install
 
@@ -47,7 +49,7 @@ make -f Makefile.lx lx-check        # validate the sample configs in lx-test/con
 ```
 
 - **`--recurse-submodules` is required.** Four dependencies are replaced by fork submodules through `replace` in `go.mod`: `sing-tun`, `gvisor` and `utls` always, `wireguard-go` (the AmneziaWG runtime) behind `with_awg`. A clone without them does not compile.
-- **Tags.** `make -f Makefile.lx lx-print-tags` prints the set: upstream's client tags without the server-only ones (`with_acme`, `with_ccm` / `with_ocm`), plus `with_purego` and the fork's `with_xhttp`, `with_awg`, `with_lx_command`, `with_lxd`, `with_lx_chain`, `with_trusttunnel`. The upstream `Makefile` is untouched.
+- **Tags.** `make -f Makefile.lx lx-print-tags` prints the set: upstream's client tags without the server-only ones (`with_acme`, `with_ccm` / `with_ocm`), plus `with_purego` and the fork's `with_xhttp`, `with_awg`, `with_lx_command`, `with_lxd`, `with_lx_chain`, `with_trusttunnel`, `with_lx_impair`. The upstream `Makefile` is untouched.
 - **Toolchain.** The Go version is pinned in [`go.version`](go.version) and read by every CI job; the upstream version the fork is based on is in [`upstream.version`](upstream.version).
 - **Android.** `make lib_install && make lib_android` builds both AARs. The AAR has no `clash_api` and no `lxd`: an Android app talks to the core over the native `CommandClient`.
 
@@ -152,18 +154,17 @@ No build tag · [feature](SPECS/FEATURES/019-SNIFF_GUARD/FEATURE.md) · [config]
 
 ### `chain` builds a multi-hop path from groups without copying them
 
-Entry, middle and exit are each chosen by their own selector or `urltest`, and the path follows the choice. The `chain` outbound assembles the hops at runtime from existing groups and nodes, lowers the MTU of tunnel links automatically, and strips one-sided DPI tricks from inner links.
+Entry, middle and exit are each chosen by their own selector or `urltest`, and the path follows the choice. At config load every node on a position ≥ 1, group members included, gets `detour` onto the hop of the position below; a node keeps one instance and one path, so a group on a position checks the path its traffic takes. The MTU alignment and strip filters of `lx.detour` apply to these nodes as to any node under `detour`.
 
 ```jsonc
 {
   "type": "chain", "tag": "via-three",
   "outbounds": ["selector-in", "selector-mid", "selector-exit"],   // entry → exit
-  "idle_timeout": "5m",
-  "rewrite": { "wireguard": { "mtu": 1200 } }                      // merge-patch per node type, links only
+  "rewrite": { "wireguard": { "mtu": 1200 } }                      // merge-patch per node type, positions ≥ 1 only
 }
 ```
 
-The path shows in `detourList` and `GetChains`; the hop tags `<tag>#0`, `<tag>#1`, … give per-layer latency through URLTest. Limits: verified on a live stand with real hops; WireGuard links have not been checked on a device.
+The path shows in `detourList` and `GetChainStatus`, every change to a node in `GetOutboundConfig`; the hop tags `<tag>#0`, `<tag>#1`, … give per-layer latency through URLTest. Limits: verified on live stands with real hops; WireGuard on a chain position has not been checked on a device.
 
 `with_lx_chain` · [feature](SPECS/FEATURES/015-CHAIN/FEATURE.md) · [config](docs-lx/lx-chain.md) ([RU](docs-lx/lx-chain.ru.md))
 
@@ -171,11 +172,16 @@ The path shows in `detourList` and `GetChains`; the hop tags `<tag>#0`, `<tag>#1
 
 A group of nodes spreads connections over several servers or holds on to one working server, instead of always picking the node with the lowest delay. `mode: round_robin` with `balancer{…}` spreads connections over a pool of live nodes and keeps each site on its own node; `mode: failover` holds the node until it fails and probes only that node; `least_test`, when a connection through a node fails to open, penalises the node and opens the connection through the next one.
 
-A pool server that goes down between checks drops no requests: the connection opens through a neighbouring node, and the dead one is replaced with a live one at once. A site closed to one node opens through another node of the pool, while the rest of the traffic stays on its nodes.
+A pool server that goes down between checks drops no requests: the connection opens through a neighbouring slot. A node that refuses connections leaves the pool in under a second; a node that accepts and stays silent is skipped by new connections from the 5th second and struck out in 41 s. Its slot is taken at once by a node from the reserve of `max(⌈pool/2⌉, 1)` live nodes the scheduled check keeps. A node is struck out only when it stays silent on its own probe while a control node answers, so a phone falling asleep, a Wi-Fi switch or an ISP outage leave the pool alone; while nobody answers, the pause between checks grows 15 → 30 → 60 → 120 s and does not drain the battery. A site closed to one node opens through another node of the pool, while the rest of the traffic stays on its nodes.
 
-Limits: recovery from failed connections works only in `round_robin`; the pool state for a UI (`GetPool`) is in a build with `with_lx_command`.
+```jsonc
+{ "type": "urltest", "tag": "auto", "outbounds": ["node-a", "node-b", "node-c", "node-d"],
+  "mode": "round_robin", "balancer": { "pool": 3 } }   // sticky by ["process","domain"] by default
+```
 
-No build tag · verified on a device with a real multi-node pool · [feature](SPECS/FEATURES/007-URLTEST_BALANCE/FEATURE.md) · [guide](docs-lx/lx-urltest.md) ([RU](docs-lx/lx-urltest.ru.md))
+Limits: recovery from failed connections works only in `round_robin`; UDP failures move no sites; a network change the platform does not report (Windows Modern Standby included) can strike out a live node once, and it comes back by itself. The pool state for a UI (`GetPool`) is in a build with `with_lx_command`. The cost per connection — [measurements](SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/IMPLEMENTATION_REPORT.md).
+
+No build tag · verified on a device with a real multi-node pool · [feature](SPECS/FEATURES/007-URLTEST_BALANCE/FEATURE.md) · [guide](docs-lx/lx-urltest.md#pool-self-heal) ([RU](docs-lx/lx-urltest.ru.md#самовосстановление-пула))
 
 ### A DNS server group answers from several servers as one
 
@@ -203,12 +209,6 @@ Limits: built into the AAR only (`with_lx_idle_suspend`); a desktop binary given
 
 [feature](SPECS/FEATURES/008-ENERGY/FEATURE.md)
 
-### Apps read the core's state over gRPC
-
-A client shows groups, the round-robin pool, chains, live rules, the running config, DNS queries and the path of every connection without scraping logs. The libbox `CommandClient` gains `URLTestOutbound`, `GetRules`, `GetGroups`, `GetOutbounds`, `GetPool`, `GetDNSGroups`, `GetRunningConfig`, `GetChains`, `SubscribeDNSQueries` and `Connection.detourList`; the same contract serves the Android AAR and the `lxd` daemon.
-
-`with_lx_command` · consumed by LxBox · [feature](SPECS/FEATURES/006-OBSERVABILITY/FEATURE.md) · [API](docs-lx/lxd-grpc-api.md) ([RU](docs-lx/lxd-grpc-api.ru.md))
-
 ### The `lxd` daemon keeps its control channel through every config change
 
 A core on a router or a server is managed remotely and stays reachable when a new config is broken. `sing-box lxd` runs the core inside a daemon that owns the listening port, so the channel comes up before the core and outlives it.
@@ -221,6 +221,8 @@ sing-box lxd --state-dir ./lxd-state -c config.json
 - **One port, two planes.** gRPC for state and logs, REST `/admin/*` for control.
 - **mTLS with enrolment.** The daemon is its own CA, prints a one-time invite and knows clients by certificate afterwards.
 - **Host telemetry.** CPU per core, memory, temperature, disks, interfaces and an IP → device directory, over the same port.
+- **Rule-sets and geo bases are uploaded by name.** `PUT /admin/resources/{name}` refuses a rule-set the core cannot load and keeps the previous copy until a core has started with the new one.
+- **The core updates itself on a Linux router.** `sing-box lxd update` downloads the release asset for the platform, verifies it against `SHA256SUMS`, swaps the binary atomically, restarts the service and rolls back if the new one does not come up; on a router with little flash it switches to a low-space mode.
 - **Service install.** Automatic on macOS and Windows. On Linux (systemd, OpenWrt / procd) the daemon prints a ready recipe and does not touch the disk; for OpenWrt there is an [installer script](scripts-lx/openwrt/README.md).
 
 Limits: not in the Windows 7 build and not in the AAR.
@@ -238,6 +240,93 @@ The same core and the same config JSON run in different products; mapping subscr
 - **Distributions** — the ALT Linux `sing-box` package is built with `with_xhttp` and `with_awg`.
 
 The full list with links and what each project takes — **[docs-lx/consumers.md](docs-lx/consumers.md)** ([RU](docs-lx/consumers.ru.md)), as of 2026-11-23.
+
+## For developers: build a client, launcher or router firmware on this core
+
+A team shipping a VPN client, a desktop launcher, router firmware or a management panel gets from this core what matters most during development: [observability](#observability-over-grpc-the-app-sees-what-the-core-is-doing), the live state of the core over gRPC; [network impairment](#network-impairment-without-root-a-controlled-bad-link-inside-the-core) without root to test the product on a bad link before users find the bugs; [a daemon API for a router panel and firmware hooks](#a-daemon-api-for-a-router-web-panel-and-firmware-hooks); [builds of any branch](#builds-of-any-branch-and-config-checks) to try a fix on a device.
+
+### Observability over gRPC: the app sees what the core is doing
+
+A client or a panel shows the live state of the core without scraping logs or opening a Clash API port. One contract runs over two carriers: gRPC of the `lxd` daemon on a desktop, server or router, and the libbox `CommandClient` in the Android and iOS library. The fields mean the same on both, so one UI code path serves a phone and a remote router.
+
+- **Connections.** A stream of the connection table with each connection's path through groups and chains (`detourList`) and the rule that matched it (`GetRules`); closing a connection is one call.
+- **DNS.** Every query with its answers and CNAME chain (`SubscribeDNSQueries`).
+- **Groups and nodes.** `GetGroups`, the balancer slots with `live` / `dead` / `quarantined` and the moved sites (`GetPool`), chains (`GetChainStatus`), DNS groups, the state of WireGuard / AmneziaWG and Tailscale endpoints by tag.
+- **Probes on demand.** The delay of one node (`URLTestOutbound`) and which exit address a node gives (`GetURLViaOutbound`).
+- **The core as a whole.** The running config as written and as built (`GetRunningConfig`, `GetEffectiveConfig`, `GetOutboundConfig`), the core's log, memory, goroutines, traffic.
+
+```text
+SubscribeConnections{interval: 1s}       → the connection table with each connection's path
+SubscribeDNSQueries{includeAnswers: true} → DNS queries with CNAME chains
+GetPool{tag}                             → balancer slots and their state
+```
+
+The same calls work from a terminal: the fork extends the upstream `sing-box api` command with the `group pool`, `connection-test` and `impair` subcommands.
+
+Limits: the fork's calls are in a build with `with_lx_command`; without the tag they answer `Unimplemented`.
+
+`with_lx_command` · consumed by LxBox · [feature](SPECS/FEATURES/006-OBSERVABILITY/FEATURE.md) · [API](docs-lx/lxd-grpc-api.md) ([RU](docs-lx/lxd-grpc-api.ru.md))
+
+### Network impairment without root: a controlled bad link inside the core
+
+A balancer, failover or a new transport is tested against real servers on a bad network without netem, root or a lab: the `impair` outbound degrades the link inside the core itself, on a desktop, a router or a phone. The config sets what to degrade, how much and when, and `seed` repeats a run exactly. It sits under a proxy node and degrades the road to its server in both directions from one end:
+
+- a bottleneck rate with a queue, delay and jitter, rate swings;
+- loss in bursts (Gilbert model) for datagrams; on a TCP carrier a loss stops the stream the way a retransmission does;
+- random stalls of the whole link and outages on a schedule, once or in a repeating round, silent or with a connection reset;
+- sublinks for part of the traffic: one site, a port, every N-th connection, a share of UDP flows — when `impair` stands over a node, it sees each site;
+- profiles `dsl`, `lte-walk`, `wifi-lossy` and your own in `lx.impair_profiles`, one switch of `profile` changes the whole line;
+- `seed`: the same run with the same losses, jumps and stalls every time, so a regression shows up as a difference in the build, not in luck.
+
+```jsonc
+{ "type": "impair", "tag": "line-a", "seed": 1, "start": "first_use", "schedule_repeat": "2m",
+  "link_params": { "profile": "lte-walk" },
+  "sublinks": [ { "match": { "domain_suffix": "example.org" }, "link_params": { "loss": "30%" } } ],
+  "schedule": [ { "at": "60s", "link_params": { "outage": true, "reset": true } },
+                { "at": "70s", "link_params": { "outage": false } } ] }
+```
+
+The experiment is driven at runtime, without a core restart that would reset the groups' state. `sing-box api impair set` or `SetImpair` over gRPC change the link mid-run, `ScheduleImpair` replaces the schedule, and observability shows how the pool and the connections respond:
+
+```bash
+sing-box api impair set line-a '{"link_params": {"outage": true, "reset": true}}'   # break the link now
+sing-box api group pool auto                                                        # what the balancer did
+sing-box api impair set line-a '{"link_params": {"profile": "dsl"}}'                 # a steady line from now on
+```
+
+`with_lx_impair` is in the release binaries and the AAR, adds 150 KB and does nothing until a config declares `"type": "impair"`; on start it logs a warning that the link is degraded on purpose. Limits: the receive side is degraded after the real network, so the server still sees the real round-trip time.
+
+[guide with recipes for `round_robin` and `failover`](docs-lx/lx-impair.md#recipes-for-balancing-tests) ([RU](docs-lx/lx-impair.ru.md#рецепты-для-испытаний-балансировки)) · [feature](SPECS/FEATURES/020-IMPAIR/FEATURE.md)
+
+### A daemon API for a router web panel, and firmware hooks
+
+A router panel is built on the `lxd` daemon's API, with no agent of its own on the device. Same port and same mTLS as observability:
+
+- **Who is on the network.** `GET /admin/clients-info` turns LAN addresses into devices: name, MAC, SSID, interface; `PUT /admin/clients-info/labels/{key}` keeps the name the operator gave.
+- **The state of the machine.** `GET /admin/host` — CPU per core, memory, thermal sensors, disks, file descriptors; `GET /admin/host/interfaces` — counters and rates of every interface; `GET /admin/stats` — the core's traffic and connections.
+- **Maintenance buttons.** `daemon.json` defines named commands (`"update": "/usr/bin/sing-box lxd update"`), and `POST /admin/commands/{name}` runs them by name with no input from the client; the output and exit code are read through the same API.
+- **Profiles.** `/admin/pprof` serves heap, goroutine, CPU and trace from the remote machine.
+
+Hooks fit the core into firmware. The daemon runs scripts from `<state-dir>/hooks/` on `pre_start`, `post_start`, `post_reload` and `post_stop` and passes the event and reason (`LXD_EVENT`, `LXD_REASON`) and the TUN interface, address and MTU (`LXD_TUN_INTERFACE`, `LXD_TUN_ADDRESS`, `LXD_TUN_MTU`) in the environment. Firmware adds its own firewall rules and routes for the TUN that came up. A failing `pre_start` keeps the core from starting; the outcome of each hook's last run shows in `/admin/status`.
+
+```sh
+#!/bin/sh
+# <state-dir>/hooks/post_start
+nft add rule inet fw4 forward iifname "$LXD_TUN_INTERFACE" accept
+```
+
+Limits: the daemon is not in the AAR or the Windows 7 build.
+
+[operator's guide](docs-lx/lxd-daemon.md) ([RU](docs-lx/lxd-daemon.ru.md)) · [hooks](docs-lx/lxd-daemon.md#6a-hooks-the-daemon-runs-the-admins-scripts-when-the-core-changes-state) · [feature](SPECS/FEATURES/014-LXD_DAEMON/FEATURE.md)
+
+### Builds of any branch and config checks
+
+The `lx-build.yml` workflow builds a binary, Linux musl, the Android AAR or the Apple xcframework from any branch or tag of this repository, so a branch with a fix goes onto a device before the release:
+
+```bash
+gh workflow run lx-build.yml -f target=android-aar -f branch=<branch>
+make -f Makefile.lx lx-check      # build, then sing-box check every config in lx-test/config/
+```
 
 ## How the fork stays close to upstream
 

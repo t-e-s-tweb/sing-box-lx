@@ -555,12 +555,12 @@ func (s *URLTest) rrHealRetry(ctx context.Context, network string, failed adapte
 		return rrRetried{}, false
 	}
 	s.group.balancedRetrying(ctx, retry, failed.Tag())
-	dialer, err := adapter.ResolveChainLeaf(ctx, retry)
+	leafCtx, dialer, err := adapter.ResolveChainLeaf(ctx, retry)
 	if err != nil {
 		return rrRetried{}, false
 	}
 	retryStart := time.Now()
-	retryCtx, dial := s.rrTrackDial(rrMarkDial(ctx), b.trackOf(retry.Tag()), retry, dialer, rrClock(retryStart), !tcp)
+	retryCtx, dial := s.rrTrackDial(rrMarkDial(leafCtx), b.trackOf(retry.Tag()), retry, dialer, rrClock(retryStart), !tcp)
 	if err = open(retryCtx, dialer); err != nil {
 		s.logger.DebugContext(ctx, "round_robin retry via ", retry.Tag(), " failed: ", err)
 		if !dial.failed() && ctx.Err() == nil && !lxtrace.IsProbe(ctx) && b.heal.counts(retryStart) {
@@ -780,27 +780,24 @@ func (g *URLTestGroup) rrStore(probe rrProbe) {
 
 // --- rounds (§4.2, §5) ------------------------------------------------------------
 
-// rrStartCheck starts the check of the pool when the round of the group is free and
-// the pause is over (or the right xr of W5 is open); it reports whether it did. Only
-// a soft sign on a pool node asks for it (§4.2).
-func (s *URLTest) rrStartCheck() bool {
+// rrStartRound starts round (rrHealCheck or rrHealSearch) when the round of the
+// group is free and the pause is over (or the right xr of W5 is open); it reports
+// whether it did. Only a soft sign on a pool node asks for the check (§4.2).
+func (s *URLTest) rrStartRound(round func()) bool {
 	if !s.balancer.heal.beginRound(time.Now()) {
 		return false
 	}
-	go s.rrHealCheck()
+	go round()
 	return true
 }
 
 // rrStartSearch starts the replacement search (§5): an empty slot or the slot of a
-// quarantined node with no replacement; no probe of a pool node, no control. With
+// quarantined node with no replacement; no probe of a pool node, no control. The
+// slot of an unverified node is no slot of the search: the check verifies it. With
 // no candidate, or while a run holds its flag (the run fills the slots itself),
 // there is nothing to probe and no round (W1).
 func (s *URLTest) rrStartSearch() bool {
-	if s.group.checking.Load() || !s.rrHasCandidate() || !s.balancer.heal.beginRound(time.Now()) {
-		return false
-	}
-	go s.rrHealSearch()
-	return true
+	return !s.group.checking.Load() && s.rrHasCandidate() && s.rrStartRound(s.rrHealSearch)
 }
 
 // rrExtraRound is the round of the right xr (W5): the check when a suspicion still
@@ -810,20 +807,22 @@ func (s *URLTest) rrExtraRound() {
 	now, epoch := rrClock(time.Now()), s.balancer.heal.epoch()
 	for _, entry := range s.balancer.slotsSnapshot() {
 		if entry.track != nil && entry.track.wantCheck.Load() && entry.track.suspected(now, epoch) {
-			s.rrStartCheck()
+			s.rrStartRound(s.rrHealCheck)
 			return
 		}
 	}
-	if s.rrSlotToFill() {
+	if s.rrSlotToVerify() {
+		s.rrStartRound(s.rrHealCheck)
+	} else if s.rrSlotToFill() {
 		s.rrStartSearch()
 	}
 }
 
 // rrSlotToFill reports a slot to fill (§5): empty (D1), with a quarantined node, or
-// with a node without history.
+// with a node without history that is not unverified.
 func (s *URLTest) rrSlotToFill() bool {
 	for _, entry := range s.balancer.slotsSnapshot() {
-		if s.rrSlotEmpty(entry.tag) {
+		if s.rrSlotFillable(entry.tag) {
 			return true
 		}
 	}
@@ -831,7 +830,8 @@ func (s *URLTest) rrSlotToFill() bool {
 }
 
 // rrPoolOthers reports a slot of the pool other than that of tag that is not empty
-// (Q4: "the rest of the pool").
+// (Q4: "the rest of the pool"); the slot of an unverified node, with no history, is
+// not of the rest.
 func (s *URLTest) rrPoolOthers(tag string) bool {
 	for _, entry := range s.balancer.slotsSnapshot() {
 		if entry.tag != tag && !s.rrSlotEmpty(entry.tag) {
@@ -844,7 +844,8 @@ func (s *URLTest) rrPoolOthers(tag string) bool {
 // rrSlotEmpty reports a slot the pick skips and the search fills (§5): no node, a
 // quarantined one, or one without history (a dead occupant the run left, a leaf
 // whose shared history D1 of another group erased). It is no slot of the pool for
-// the check (I9).
+// the check (I9), except the slot of an unverified node, which the search does not
+// fill either (rrSlotFillable).
 func (s *URLTest) rrSlotEmpty(tag string) bool {
 	return tag == "" || !s.slotAlive(tag)
 }
@@ -884,12 +885,8 @@ type rrCheck struct {
 	size       int // |P|: the size of a batch of candidates
 	results    chan rrCheckResult
 	flying     int
-	answered   []bool      // a probe of the pool node answered in this check (D3)
-	firstAt    []time.Time // the start of the first probe of the pool node
-	firstEnded []bool
-	voided     []bool // the decisive probe of the pool node was cancelled: no D1 (U3)
-	partOf     []int  // the decisive part of the pool node; -1 for none
-	waiting    []int  // pool nodes of a part whose decisive probe waits (step 3)
+	nodes      []rrPoolProbe // the probes of each pool node, by index
+	waiting    []int         // pool nodes of a part whose decisive probe waits (step 3)
 	parts      []*rrDecisivePart
 	control    adapter.Outbound
 	b0         time.Time
@@ -903,40 +900,43 @@ type rrCheck struct {
 	anyAnswer  bool // a probe of the round answered (W2)
 	// grants carries the work of the places granted by the queue to the loop: the
 	// loop never waits for places itself, since the places it waits for may be
-	// held by its own part whose probes wait for the loop. requests counts the
-	// goroutines that wait for places; a pending grant counts as flying.
-	grants   chan func()
-	requests sync.WaitGroup
+	// held by its own part whose probes wait for the loop. Its buffer holds every
+	// request of the round (the first probes, the decisive parts and k batches of
+	// candidates, each in parts of at most U), so the queue hands a grant over
+	// without waiting. A request not granted yet counts as flying; asked are the
+	// requests of the round.
+	grants chan func()
+	asked  []*rrQueueRequest
 	// reserved are the places of granted decisive parts not used yet: by a decisive
 	// probe waiting to start or by a control after.
 	reserved int
 	launched int // the probes the round started; none: no round (W1)
 }
 
-// request asks the queue for n places and hands then to the loop once they are
-// granted (U1); with the round over it gets nothing to do. The request takes its
-// place in the line here, in the order of the calls (U1, U2: rrQueue.enqueue); only
-// the wait for the grant runs aside.
-func (c *rrCheck) request(n int, then func()) {
-	c.flying++
-	c.requests.Add(1)
-	owner := &c.s.balancer.heal.queue
-	queued := c.queue.enqueue(owner, n)
-	go func() {
-		defer c.requests.Done()
-		if !c.queue.await(c.ctx, owner, queued) {
-			c.grants <- func() {}
-			return
-		}
-		c.grants <- then
-	}()
+// rrPoolProbe is what the check knows of the probes of one pool node.
+type rrPoolProbe struct {
+	answered   bool      // a probe of the node answered in this check (D3)
+	firstAt    time.Time // the start of its first probe
+	firstEnded bool
+	voided     bool // its decisive probe was cancelled: no D1 (U3)
+	part       int  // its decisive part
 }
 
-// settle ends a round: the requests still waiting give up (the context is
-// cancelled), and the places granted meanwhile go back through probes that end at
-// once.
+// request asks the queue for n places and hands then to the loop once they are
+// granted (U1). The queue hands the grant over under its lock; the buffer of grants
+// holds every request of the round, so the hand-over never waits.
+func (c *rrCheck) request(n int, then func()) {
+	c.flying++
+	c.asked = append(c.asked, c.queue.ask(&c.s.balancer.heal.queue, n, func() { c.grants <- then }))
+}
+
+// settle ends a round: the requests still waiting are withdrawn, and the places
+// granted meanwhile go back through probes that end at once.
 func (c *rrCheck) settle() {
-	c.requests.Wait()
+	for _, request := range c.asked {
+		c.queue.withdraw(&c.s.balancer.heal.queue, request)
+	}
+	c.asked = nil
 	for {
 		select {
 		case then := <-c.grants:
@@ -957,7 +957,7 @@ func (c *rrCheck) launch(role rrCheckRole, index int, node adapter.Outbound, fro
 	c.launched++
 	// The decisive probe of a node whose first probe still flies flies beside it from
 	// the moment of step 3, not after its end (U3).
-	alone := role == rrRoleDecisive && !c.firstEnded[index]
+	alone := role == rrRoleDecisive && !c.nodes[index].firstEnded
 	go func() {
 		probe := c.s.group.rrSelfProbe(c.ctx, node, from, alone)
 		c.queue.release(1)
@@ -976,7 +976,7 @@ func (c *rrCheck) launchAll(role rrCheckRole, first int, nodes []adapter.Outboun
 		c.request(end-start, func() {
 			for i := start; i < end; i++ {
 				if role == rrRoleFirst {
-					c.firstAt[first+i] = time.Now()
+					c.nodes[first+i].firstAt = time.Now()
 				}
 				c.launch(role, first+i, nodes[i], c.x, batch)
 			}
@@ -1061,10 +1061,10 @@ func (c *rrCheck) take(r rrCheckResult) {
 	}
 	switch r.role {
 	case rrRoleFirst:
-		c.firstEnded[r.index] = true
+		c.nodes[r.index].firstEnded = true
 		if r.probe.answered {
-			if !c.answered[r.index] {
-				c.answered[r.index] = true
+			if !c.nodes[r.index].answered {
+				c.nodes[r.index].answered = true
 				c.s.rrAlive(r.probe) // D3
 			}
 			c.found(c.pool[r.index])
@@ -1073,16 +1073,16 @@ func (c *rrCheck) take(r rrCheckResult) {
 			c.startDecisive()
 		}
 	case rrRoleDecisive:
-		part := c.parts[c.partOf[r.index]]
+		part := c.parts[c.nodes[r.index].part]
 		if r.probe.answered {
-			if !c.answered[r.index] {
-				c.answered[r.index] = true
+			if !c.nodes[r.index].answered {
+				c.nodes[r.index].answered = true
 				c.s.rrAlive(r.probe) // D3
 			}
 		} else {
 			part.missed = true
 		}
-		c.partDone(c.partOf[r.index])
+		c.partDone(c.nodes[r.index].part)
 	case rrRoleAfter:
 		if r.probe.answered {
 			c.parts[r.index].afterOK = true
@@ -1102,13 +1102,13 @@ func (c *rrCheck) take(r rrCheckResult) {
 func (c *rrCheck) void(r rrCheckResult) {
 	switch r.role {
 	case rrRoleFirst:
-		c.firstEnded[r.index] = true
+		c.nodes[r.index].firstEnded = true
 		if len(c.waiting) > 0 {
 			c.startDecisive()
 		}
 	case rrRoleDecisive:
-		c.voided[r.index] = true
-		c.partDone(c.partOf[r.index])
+		c.nodes[r.index].voided = true
+		c.partDone(c.nodes[r.index].part)
 	}
 }
 
@@ -1122,7 +1122,7 @@ func (c *rrCheck) found(node adapter.Outbound) {
 	c.control, c.b0 = node, time.Now()
 	var nodes []int
 	for i := range c.pool {
-		if !c.answered[i] {
+		if !c.nodes[i].answered {
 			nodes = append(nodes, i)
 		}
 	}
@@ -1131,7 +1131,7 @@ func (c *rrCheck) found(node adapter.Outbound) {
 		part := len(c.parts)
 		c.parts = append(c.parts, &rrDecisivePart{open: end - start})
 		for _, i := range nodes[start:end] {
-			c.partOf[i] = part
+			c.nodes[i].part = part
 		}
 		members := nodes[start:end]
 		c.request(end-start+1, func() {
@@ -1150,11 +1150,11 @@ func (c *rrCheck) startDecisive() {
 	kept := c.waiting[:0]
 	for _, i := range c.waiting {
 		switch {
-		case c.answered[i]:
+		case c.nodes[i].answered:
 			c.reserved--
 			c.queue.release(1)
-			c.partDone(c.partOf[i])
-		case c.firstEnded[i] || !c.firstAt[i].IsZero() && now.Sub(c.firstAt[i]) >= rrHangAfter:
+			c.partDone(c.nodes[i].part)
+		case c.nodes[i].firstEnded || !c.nodes[i].firstAt.IsZero() && now.Sub(c.nodes[i].firstAt) >= rrHangAfter:
 			c.reserved--
 			c.launch(rrRoleDecisive, i, c.pool[i], c.b0, -1)
 		default:
@@ -1224,8 +1224,8 @@ func (s *URLTest) rrHealRound(round func(c *rrCheck)) {
 func (s *URLTest) rrHealCheck() {
 	s.rrHealRound(func(c *rrCheck) {
 		for _, entry := range s.balancer.slotsSnapshot() {
-			if s.rrSlotEmpty(entry.tag) {
-				continue // a quarantined node or one without history takes no part; a struck one left its slot (§4.2)
+			if s.rrSlotEmpty(entry.tag) && !s.group.rrUnverified(entry.tag) {
+				continue // a quarantined node or one without history takes no part; a struck one left its slot (§4.2); an unverified one does (SPEC 019)
 			}
 			if node, loaded := s.outbound.Outbound(entry.tag); loaded && common.Contains(node.Network(), N.NetworkTCP) {
 				c.pool = append(c.pool, node)
@@ -1235,9 +1235,7 @@ func (s *URLTest) rrHealCheck() {
 		n := len(c.pool)
 		c.results = make(chan rrCheckResult, 3*n+2*rrCandidateBatches*c.size+1)
 		c.grants = make(chan func(), 2*n+2*rrCandidateBatches*c.size+1)
-		c.answered, c.firstEnded, c.firstAt = make([]bool, n), make([]bool, n), make([]time.Time, n)
-		c.voided = make([]bool, n)
-		c.partOf = make([]int, n)
+		c.nodes = make([]rrPoolProbe, n)
 		c.launchAll(rrRoleFirst, 0, c.pool) // step 1
 		c.left = n
 		if n == 0 {
@@ -1295,10 +1293,10 @@ func (s *URLTest) rrLap() bool {
 func (s *URLTest) rrStrike(ctx context.Context, c *rrCheck) {
 	b := s.balancer
 	for i, node := range c.pool {
-		if c.answered[i] || c.voided[i] || c.control == nil || b.heal.aborted(ctx) {
+		if c.nodes[i].answered || c.nodes[i].voided || c.control == nil || b.heal.aborted(ctx) {
 			continue // D3, no outcome of the decisive probe (U3), or no control (D5)
 		}
-		if part := c.partOf[i]; part >= len(c.parts) || !c.parts[part].afterOK {
+		if part := c.nodes[i].part; part >= len(c.parts) || !c.parts[part].afterOK {
 			continue // D4
 		}
 		t := b.trackOf(node.Tag())
@@ -1309,6 +1307,7 @@ func (s *URLTest) rrStrike(ctx context.Context, c *rrCheck) {
 			continue // D1: a scheduled run answered for the node since x, no verdict
 		}
 		others := s.rrPoolOthers(node.Tag())
+		b.unverified.unmark(node.Tag())
 		s.rrDead(t)             // before the slot empties: a dial in flight either still finds its slot or is marked struck (its retry)
 		b.clearSlot(node.Tag()) // R1
 		quarantined := b.rrStrikeOut(node.Tag(), others)
@@ -1328,7 +1327,7 @@ func (s *URLTest) rrRefill(ctx context.Context, c *rrCheck) {
 	b := s.balancer
 	var empty []string
 	for _, entry := range b.slotsSnapshot() {
-		if s.rrSlotEmpty(entry.tag) {
+		if s.rrSlotFillable(entry.tag) {
 			empty = append(empty, entry.tag)
 		}
 	}
@@ -1352,8 +1351,8 @@ func (s *URLTest) rrRefill(ctx context.Context, c *rrCheck) {
 				}
 				continue
 			}
-			if dead != "" && !s.rrSlotEmpty(dead) {
-				break // its node got history back meanwhile: the slot is no longer to fill
+			if dead != "" && !s.rrSlotFillable(dead) {
+				break // its node got history back meanwhile (or a manual test left it unverified): the slot is no longer to fill
 			}
 			replaced, held := s.rrWriteSlot(ctx, func() bool { return b.replaceSlot(dead, node.Tag()) })
 			if !held {

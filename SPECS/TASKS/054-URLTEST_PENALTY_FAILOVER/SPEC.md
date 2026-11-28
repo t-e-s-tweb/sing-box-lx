@@ -5,10 +5,11 @@
 | Поле | Значение |
 |------|----------|
 | Тип | F (feature) — реакция least_test-группы на отказы боевых дайлов; дизайн владельца |
-| Статус | C (complete) — фикс в дереве, юнит-тесты зелёные; полевая проверка ждёт релиза |
+| Статус | C (complete) — фикс в дереве, юнит-тесты зелёные; полевая проверка ждёт релиза. Синк [166](../166-UPSTREAM_SYNC_1_14_4_PLUS_146/SPEC.md) (2026-11-26): апстрим на ошибке дозвона (кроме закрытия/отмены/таймаута) стирает историю листа и сразу переизбирает; на мёртвом пути этот переизбор у нас не запускается — выбор переносит 054, без `Interrupt` (`urltest_dial_reselect_lx_test.go`) |
 | Ветка | `lx` |
 | Base | `008ad3ac2` (v1.14.0-lx.21 + reality minClientVer) |
 | История | [HISTORY.md](HISTORY.md) |
+| Реестр хотфиксов | в [FEATURE 004](../../FEATURES/004-HOTFIXES/FEATURE.md#реестр): меняет поведение least_test у конфига без lx-опций (CONSTITUTION §3.2), решение владельца 2026-11-26 |
 | Связанные | [SPEC 052](../052-NETSTACK_CONNECT_DEADLINE/SPEC.md) (поставщик ошибок: 15s-дедлайн вместо 127s тишины), [RESEARCH 052](../052-NETSTACK_CONNECT_DEADLINE/RESEARCH.md) (ловушки S2/S6, прилипание urltest), SPEC 019 (режимы), [SPEC 116](../116-URLTEST_FAILOVER_MODE/SPEC.md) (режим failover), SPEC 020 (reachability/wake) |
 
 **Touches:** только least_test (и `failover`, SPEC 116). round_robin-пул (SPEC 019 v2)

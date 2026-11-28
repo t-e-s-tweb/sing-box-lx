@@ -169,6 +169,12 @@ device a nil panic in `udpNat.Start()` when a WireGuard endpoint started, every 
 and updating would wipe the AWG obfuscation and SPEC 041. The correct path is to carry our patches
 on top of the full upstream line (re-graft), not to pull upstream fragments onto our old base.
 
+The `wireguard-go` fork's branches mirror the superproject: `lx` is the main line, `lx-1.15` the
+1.15 line; the submodule pin is always the tip of its branch. A re-graft produces a history
+unrelated to `lx`, so it lands in `lx` through a `-s ours --allow-unrelated-histories` merge made
+from the new line (the tree is the new line, the old commits stay in history) rather than in a new
+branch. The old `lx-awg2-v003`/`v005`/`v007` are an archive; do not commit there.
+
 ⚠️ After a re-graft, bump `upstream.version` (at the root, next to `go.version`). It is the base
 for `LX_VERSION` in a local `make -f Makefile.lx lx-build`. Release CI takes the version from the
 tag name and never reads this file. So a forgotten bump will not surface in the release; it only
@@ -371,6 +377,10 @@ semantics, accept upstream logic.
   history is 1.45 GB per CI clone. A new pin lands as a new snapshot commit, the patch is applied
   on top, and the red/green test travels with it. Details in SPEC 048 §6.
 - `cmd/internal/build_libbox/main.go` — the only upstream-file edit in the CI zone, marked `// lx`.
+- `common/dialer/dialer.go` / `default.go` — if upstream changed which dial fields `NewWithOptions`
+  applies under `detour`, update the list of SPEC 165 Д1 (`box_lx_detour.go`,
+  `ignoredUnderDetour`, `readByProtocol`). A stale list only misreports `GetOutboundConfig`;
+  behaviour stays upstream's.
 - `box.go`, `dns/client*.go`, `route/route.go`, `common/trafficcontrol/tracker.go` — these carry lx
   observability on top of upstream logic. On conflict keep upstream resolve and routing behaviour;
   our emit/Detour bits are additive (see the purity audit, commit 3505beb6).

@@ -6,7 +6,7 @@
 > [lx-config](lx-config.md) — what the fork has, every key in one line and how to enable it;
 > features with their own logic have a separate document with examples: [lx-urltest](lx-urltest.md),
 > [lx-dns-group](lx-dns-group.md), [lx-chain](lx-chain.md), [lx-block](lx-block.md),
-> [lx-sniff](lx-sniff.md), [lx-energy](lx-energy.md), [lx-observability](lx-observability.md);
+> [lx-sniff](lx-sniff.md), [lx-energy](lx-energy.md), [lx-observability](lx-observability.md), [lx-impair](lx-impair.md);
 > [protocols-transports](protocols-transports.md) — every field, type, default, error text;
 > [xray-protocols-explained](xray-protocols-explained.md), [amneziawg-explained](amneziawg-explained.md) and [masque-explained](masque-explained.md) —
 > how it works, why, how the fork does it and how it differs from vanilla.
@@ -29,6 +29,7 @@
 - [12. Validate & build](#12-validate--build)
 - [13. The `lx` root block](#13-the-lx-root-block)
 - [14. Tailscale: turning Taildrop off](#14-tailscale-turning-taildrop-off)
+- [15. `impair` outbound — a degraded link for testing](#15-impair-outbound--a-degraded-link-for-testing)
 
 ---
 
@@ -43,11 +44,13 @@
 | **MASQUE** outbound (CONNECT-IP / WARP) | `with_quic`+`with_gvisor` | `outbounds[].type: "masque"` | desktop + mobile |
 | **TrustTunnel** outbound and inbound | `with_trusttunnel` (+ `with_quic` for HTTP/3) | `outbounds[].type` / `inbounds[].type: "trusttunnel"`; fields — [protocols-transports.md §6](protocols-transports.md#6-trusttunnel-outbound-and-inbound), the global `lx.trusttunnel.idle_timeout` — [lx-block.md](lx-block.md#lxtrusttunnel--trusttunnel-outbounds) | desktop + mobile |
 | **Idle-suspend** | `with_lx_idle_suspend` | `lx.wg.idle.suspend` (+ `suspend_reachable`, `teardown`) | mobile only (AAR) |
-| **Root `lx` block** | — (always parsed) | `lx.wg`, `lx.masque`, `lx.trusttunnel`, `lx.mtu_align`, `lx.sniff_guard` — the fork's global knobs, [lx-block.md](lx-block.md) | desktop + mobile |
+| **Root `lx` block** | — (always parsed) | `lx.wg`, `lx.masque`, `lx.trusttunnel`, `lx.detour`, `lx.sniff_guard` — the fork's global knobs, [lx-block.md](lx-block.md) | desktop + mobile |
 | **DNS server group** | — (always built) | `dns.servers[].type: "group"` | desktop + mobile |
 | **VLESS `encryption`** | — (always built) | `encryption` on a `vless` outbound | desktop + mobile |
 | **`lxd` daemon** | `with_lxd` | not a config key — the `sing-box lxd` subcommand + `<state-dir>/daemon.json`; see [lxd-daemon.md](lxd-daemon.md) | desktop / server (not Win7, not AAR) |
+| **`urltest` load balancer**: `round_robin`, `failover` | — (always built) | `mode` and `balancer` on `urltest`: a pool with stickiness and self-heal, or holding a node until it fails — [§3](#3-urltest-node-selection-modes) | desktop + mobile |
 | **`chain` outbound** | `with_lx_chain` | `outbounds[].type: "chain"` — a multi-hop path of groups and nodes | desktop + mobile |
+| **`impair` outbound** | `with_lx_impair` | `outbounds[].type: "impair"` — a link degraded on purpose for testing, [§15](#15-impair-outbound--a-degraded-link-for-testing) | desktop + mobile |
 
 `make -f Makefile.lx lx-build` builds the desktop/CLI binary: the output is `sing-box` with version `…-lx.N`.
 The build includes `with_xhttp` and `with_awg` (plus `with_lx_command` and `with_lxd`), but not `with_lx_idle_suspend`.
@@ -208,8 +211,25 @@ the node is replaced with a live one at once. The `url`, `interval`, `idle_timeo
 }
 ```
 
-📖 How each mode works, the pool self-heal, limits and examples are in
-[lx-urltest.md](lx-urltest.md).
+**`round_robin` self-heal** works between scheduled checks and has no config keys:
+
+- a connection that does not open through a node is retried once through another slot;
+- a node that refuses connections is struck out in under a second; a node that accepts and stays
+  silent is skipped by new connections from the 5th second and struck out in 41 s;
+- a node is struck out only when it stays silent on its own probe while a control node answers:
+  device sleep and network changes leave the pool alone;
+- only a node that answered its probe takes an empty slot; the scheduled check keeps a reserve of
+  `max(⌈pool/2⌉, 1)` live nodes outside the pool, and they are taken first;
+- a site closed to one node moves to the next node of the pool; a node that breaks connections more
+  often than the rest or is struck out twice between checks goes to quarantine.
+
+Pool state: `sing-box api group pool <tag>` and `GetPool` (a build with `with_lx_command`,
+[§8](#8-observability-commandclient-extensions)).
+
+📖 How each mode works — [lx-urltest.md](lx-urltest.md); [pool self-heal](lx-urltest.md#pool-self-heal)
+with failure scenarios and limits; [`failover`](lx-urltest.md#4-failover--hold-until-it-fails); the
+feature — [URLTEST_BALANCE](../SPECS/FEATURES/007-URLTEST_BALANCE/FEATURE.md); the self-heal rules —
+[SPEC 138](../SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/SPEC.md).
 
 ---
 
@@ -346,8 +366,10 @@ config keys: the methods are in a build with `with_lx_command` (part of
 | `GetPoolState(groupTag)` | the same plus moved keys, address problems and the freeze |
 | `GetDNSGroups()` | the live state of every `group` DNS server |
 | `GetRunningConfig()` | the canonical JSON of the running config |
+| `GetEffectiveConfig()` | the same config after the lx pre-pass: chain hops added, `detour` of taken-over nodes rewritten, MTU aligned |
+| `GetOutboundConfig(tag)` | one node as written, as built, and the list of changes between them |
 | `SubscribeDNSQueries(includeAnswers, handler)` | a live stream of DNS queries |
-| `GetChains()` | the state of every `chain` outbound by position |
+| `GetChainStatus(tag)` | the state of one `chain` outbound by position |
 | `SetEndpointEnabled(tag, enabled)` | turns a WG/AWG endpoint off and on at runtime |
 
 Connections in the stream carry a `detourList` field — the path through `detour` to the final
@@ -367,7 +389,8 @@ A relay that reads the SNI from the ClientHello and sends the connection to that
 `sniffing` with `destOverride` without `routeOnly`) takes a node with a masking SNI (REALITY, WARP)
 to someone else's host. Such a relay cannot parse a split ClientHello. Without the
 `lx.sniff_guard` block the core splits the ClientHello as upstream — only on nodes with `fragment`
-or `record_fragment`. The block turns protection on for paths through relays and learns from
+or `record_fragment`; under a `detour` without a kernel socket below, the node's `fragment` is
+dropped by `lx.detour.strip` by default, `record_fragment` stays. The block turns protection on for paths through relays and learns from
 connection outcomes; its keys are in [§13](#13-the-lx-root-block).
 
 ```json
@@ -382,19 +405,20 @@ connection outcomes; its keys are in [§13](#13-the-lx-root-block).
 ## 10. `chain` outbound — a virtual multi-hop path of groups and nodes
 
 The `chain` outbound builds a multi-hop path from existing nodes and groups. Each position is chosen
-by its own group with all of its logic, and the chain follows the choice. A node at position ≥ 1
-works through its link — an instance that dials its own server through the previous position.
-Links are created on first use and removed after `idle_timeout` without connections. The links'
-MTU is fitted on its own, and one-sided anti-DPI tricks are stripped on inner positions. It needs
-the `with_lx_chain` build tag (in the desktop `LX_TAGS` and in the AAR).
+by its own group with all of its logic, and the chain follows the choice. At config load every node
+reached on a position ≥ 1, group members included, gets `detour` onto the hop of the position below,
+`<tag>#<i−1>`, an internal outbound of type `chain-hop`; the node's own `detour` is overridden. A
+node keeps one instance and one path, and a group on a position checks the instances that carry
+its traffic. MTU alignment and the strip filters of `lx.detour` act on these nodes as on any node
+under `detour`. It needs the `with_lx_chain` build tag (in the desktop `LX_TAGS` and in the AAR).
 
 | Key | Default | What it sets |
 |-----|---------|--------------|
 | `outbounds` | required | position tags in packet order, from the client to the exit; at least two, all different |
-| `idle_timeout` | `5m` | after how long a link without live connections is removed; `0` — live until shutdown |
-| `strip_evasion` | `true` | strip one-sided anti-DPI tricks from links at positions ≥ 1 |
-| `strip` | `{}` | changes to the strip list: `false` — keep, `true` — strip as well |
-| `rewrite` | `{}` | a merge-patch to the links' config by node type at positions ≥ 1 |
+| `rewrite` | `{}` | a merge-patch to the config of taken-over nodes by node type at positions ≥ 1; it cannot touch `detour` |
+| `interrupt_exist_connections` | `false` | on a position toggle, also cut the user connections through the chain |
+
+`idle_timeout`, `strip_evasion` and `strip` in a chain fail the load and name the replacement.
 
 ```jsonc
 {
@@ -405,7 +429,7 @@ the `with_lx_chain` build tag (in the desktop `LX_TAGS` and in the AAR).
 }
 ```
 
-The strip catalogue, link MTU, observability and limits are in [lx-chain.md](lx-chain.md).
+How the hops work, the load errors, the toggle, observability and limits are in [lx-chain.md](lx-chain.md).
 
 ---
 
@@ -475,7 +499,10 @@ canonical: empty sub-blocks are dropped.
 | `wg.connected_socket` | `false` | connect the tunnel socket to the server address; Linux and Android |
 | `masque.idle_timeout` | off | one sleep window for `masque` nodes without their own `idle_timeout` |
 | `trusttunnel.idle_timeout` | `5m` | one idle window for `trusttunnel` nodes without their own `idle_timeout` |
-| `mtu_align` | `clamp` | fitting MTU and packet size of nodes above tunnels: `off`, `fill`, `clamp`; the `{mode, except}` object excludes tags |
+| `detour` | `true` | what the core does to a node under `detour`: `true` — MTU alignment `clamp` and every strip filter, `false` — upstream behaviour, or an object |
+| `detour.mtu_align` | `clamp` | fitting MTU and packet size of nodes above tunnels: `off`, `fill`, `clamp` |
+| `detour.strip` | every filter | filters for a node without a kernel socket below: `true`, `false`, or `{filters: {tls: {fragment, spoof, kernel, engine}}}`; an object of filters replaces the catalog |
+| `detour.except_outbounds` | none | tags neither aligned nor filtered |
 | `sniff_guard.nodes.sni_mismatch` | `true` | protect only nodes whose SNI differs from `server` |
 | `sniff_guard.nodes.outbound_type` | every type | protect only nodes of these types |
 | `sniff_guard.detour_type` | `direct`, `ssh`, `socks` — `clean`, others — `suspect` | the starting path label by relay type: `never`, `clean`, `suspect` |
@@ -490,7 +517,7 @@ canonical: empty sub-blocks are dropped.
 "lx": {
   "wg": { "idle": { "suspend": "30s", "suspend_reachable": "5m" } },
   "masque": { "idle_timeout": "5m" },
-  "mtu_align": "clamp",
+  "detour": { "mtu_align": "clamp", "strip": true },
   "sniff_guard": {
     "tls":  { "method": "record_fragment" },
     "quic": { "method": "decoy_first_byte" }
@@ -519,3 +546,53 @@ sleep energy model is in [lx-energy.md](lx-energy.md).
 
 With `true` the node accepts no files: the sender gets a 403 `Taildrop is disabled on this node`. Sending from the node is refused as well, and the status reports `canShareFiles = false`. Files received earlier stay in `taildrop_directory` and can still be opened and deleted. Other devices on the tailnet still see the node as a target: that is set by the Tailscale admin console, not by the node.
 
+---
+
+## 15. `impair` outbound — a degraded link for testing
+
+The `impair` outbound degrades the connections that go through it on purpose: a bottleneck with a
+queue, delay and its jitter, bursty loss, rate swings, stalls and outages on a schedule, for all
+connections or only some. It dials like
+`direct` or through its own `detour`, degrades both directions from one end, and needs no root and
+no netem. Use it to test balancing, failover and chains against real servers over a bad link. The
+build tag `with_lx_impair` is in the desktop `LX_TAGS` and in the AAR; until a config declares
+`"type": "impair"` it does nothing. On start `impair` logs a warning that the link is degraded on
+purpose.
+
+Outbound keys besides the dial keys of `direct`:
+
+| Key | Default | What it sets |
+|-----|---------|--------------|
+| `link_params` | no degradation | the outbound's line: every link key lives here |
+| `sublinks` | none | a second stage for matching connections: one site, a port, a share of flows |
+| `schedule`, `schedule_repeat` | none | changes of the line and the sublinks over time; the length of a repeating round |
+| `start` | `process` | what the schedule counts from: process start or the first traffic (`first_use`) |
+| `seed` | random | the seed: the same one gives the same losses and swings |
+
+`link_params` — the same object in the outbound, a sublink, a schedule entry, `impair set` and a
+profile:
+
+| Key | Default | What it sets |
+|-----|---------|--------------|
+| `profile` | none | a template: `dsl`, `lte-walk`, `wifi-lossy` or a name from `lx.impair_profiles`; the other keys tune it |
+| `rate`, `queue` | unlimited, `"50ms"` | bottleneck rate (`"10mbit"`) and the queue before it (time or size) |
+| `delay`, `jitter` | `0` | added one-way delay and its spread |
+| `loss`, `loss_burst` | `0`, `1` | share of loss (`"0.5%"`) and mean length of a loss run |
+| `vary`, `stall` | none | rate swings and random stops of the line; `false` turns them off |
+| `outage`, `reset` | `false` | the line silently goes away; `reset` breaks the connections (schedule, `impair set`, sublink only) |
+| `up`, `down` | — | the same keys for one direction |
+
+The main placement is under a proxy node: the proxy points at `impair` with its `detour`, and the
+road to the proxy server is degraded.
+
+```jsonc
+{"type": "vless", "tag": "via-se", "server": "se.example.net", "server_port": 443, "detour": "slow-se" /* … */},
+{"type": "impair", "tag": "slow-se", "seed": 1, "link_params": {"rate": "10mbit", "delay": "20ms", "loss": "0.5%"}}
+```
+
+The link changes at runtime with `sing-box api impair set|schedule|status` and the matching gRPC
+commands.
+
+Every key with its range, sublinks, the schedule, profiles, runtime control, how datagrams and
+streams are degraded, the errors and recipes for `round_robin` and `failover` tests — in
+[lx-impair.md](lx-impair.md).

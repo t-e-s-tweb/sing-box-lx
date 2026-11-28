@@ -6,7 +6,7 @@
 > [lx-config](lx-config.ru.md) — что есть в форке, все ключи по строке и как включить; у фич со
 > своей логикой — отдельный документ с примерами: [lx-urltest](lx-urltest.ru.md),
 > [lx-dns-group](lx-dns-group.ru.md), [lx-chain](lx-chain.ru.md), [lx-block](lx-block.ru.md),
-> [lx-sniff](lx-sniff.ru.md), [lx-energy](lx-energy.ru.md), [lx-observability](lx-observability.ru.md);
+> [lx-sniff](lx-sniff.ru.md), [lx-energy](lx-energy.ru.md), [lx-observability](lx-observability.ru.md), [lx-impair](lx-impair.ru.md);
 > [protocols-transports](protocols-transports.ru.md) — каждое поле, тип, дефолт, текст ошибки;
 > [xray-protocols-explained](xray-protocols-explained.ru.md), [amneziawg-explained](amneziawg-explained.ru.md) и [masque-explained](masque-explained.ru.md) —
 > как устроено, почему, как сделано у нас и чем отличается от ванили.
@@ -29,6 +29,7 @@
 - [12. Проверка и сборка](#12-проверка-и-сборка)
 - [13. Корневой блок `lx`](#13-корневой-блок-lx)
 - [14. Tailscale: выключить Taildrop](#14-tailscale-выключить-taildrop)
+- [15. Outbound `impair` — ухудшение линии для испытаний](#15-outbound-impair--ухудшение-линии-для-испытаний)
 
 ---
 
@@ -43,11 +44,13 @@
 | **MASQUE** outbound (CONNECT-IP / WARP) | `with_quic`+`with_gvisor` | `outbounds[].type: "masque"` | desktop + mobile |
 | **TrustTunnel** outbound и inbound | `with_trusttunnel` (+ `with_quic` для HTTP/3) | `outbounds[].type` / `inbounds[].type: "trusttunnel"`; поля — [protocols-transports.ru.md §6](protocols-transports.ru.md#6-trusttunnel-outbound-и-inbound), глобальный `lx.trusttunnel.idle_timeout` — [lx-block.ru.md](lx-block.ru.md#lxtrusttunnel--trusttunnel-outboundы) | desktop + mobile |
 | **Idle-suspend** | `with_lx_idle_suspend` | `lx.wg.idle.suspend` (+ `suspend_reachable`, `teardown`) | только mobile (AAR) |
-| **Корневой блок `lx`** | — (разбирается всегда) | `lx.wg`, `lx.masque`, `lx.trusttunnel`, `lx.mtu_align`, `lx.sniff_guard` — глобальные ручки форка, [lx-block.ru.md](lx-block.ru.md) | desktop + mobile |
+| **Корневой блок `lx`** | — (разбирается всегда) | `lx.wg`, `lx.masque`, `lx.trusttunnel`, `lx.detour`, `lx.sniff_guard` — глобальные ручки форка, [lx-block.ru.md](lx-block.ru.md) | desktop + mobile |
 | **Группа DNS-серверов** | — (всегда в сборке) | `dns.servers[].type: "group"` | desktop + mobile |
 | **VLESS `encryption`** | — (всегда в сборке) | `encryption` на `vless`-outbound | desktop + mobile |
 | **Демон `lxd`** | `with_lxd` | не ключ конфига — подкоманда `sing-box lxd` + `<state-dir>/daemon.json`; см. [lxd-daemon.ru.md](lxd-daemon.ru.md) | desktop / сервер (не Win7, не AAR) |
+| **Балансировщик `urltest`**: `round_robin`, `failover` | — (всегда в сборке) | `mode` и `balancer` у `urltest`: пул со sticky-привязкой и самовосстановлением, держаться за узел до отказа — [§3](#3-режимы-выбора-узла-в-urltest) | desktop + mobile |
 | **Outbound `chain`** | `with_lx_chain` | `outbounds[].type: "chain"` — многохоповый путь из групп и узлов | desktop + mobile |
+| **Outbound `impair`** | `with_lx_impair` | `outbounds[].type: "impair"` — намеренно ухудшенная линия для испытаний, [§15](#15-outbound-impair--ухудшение-линии-для-испытаний) | desktop + mobile |
 
 Desktop/CLI-бинарь собирает `make -f Makefile.lx lx-build`: на выходе `sing-box` с версией `…-lx.N`.
 В сборку входят `with_xhttp` и `with_awg` (плюс `with_lx_command` и `with_lxd`), но не `with_lx_idle_suspend`.
@@ -206,8 +209,26 @@ Upstream `urltest` всегда выбирает узел с наименьше�
 }
 ```
 
-📖 Как работает каждый режим, самовосстановление пула, ограничения и примеры — в
-[lx-urltest.ru.md](lx-urltest.ru.md).
+**Самовосстановление `round_robin`** работает между плановыми проверками, ключей конфига у него нет:
+
+- соединение, не открывшееся через узел, один раз повторяется через другой слот;
+- узел, отказывающий в подключении, вычёркивается меньше чем за секунду; узел, который принимает
+  соединения и молчит, новые соединения обходят с 5-й секунды, а вычёркивается он за 41 с;
+- узел вычёркивается, только когда промолчал на своей пробе, а контрольный узел ответил: сон
+  устройства и смена сети пул не трогают;
+- пустой слот занимает только узел, ответивший на пробу; плановая проверка держит запас
+  `max(⌈pool/2⌉, 1)` живых узлов вне пула, и они берутся первыми;
+- сайт, закрытый для одного узла, переходит на следующий узел пула; узел, который рвёт соединения
+  чаще остальных или вычеркнут дважды между проверками, уходит в карантин.
+
+Состояние пула: `sing-box api group pool <tag>` и `GetPool` (сборка с `with_lx_command`,
+[§8](#8-наблюдаемость-расширения-commandclient)).
+
+📖 Как работает каждый режим — [lx-urltest.ru.md](lx-urltest.ru.md);
+[самовосстановление пула](lx-urltest.ru.md#самовосстановление-пула) со сценариями сбоев и
+ограничениями; [`failover`](lx-urltest.ru.md#4-failover--держаться-до-отказа); фича —
+[URLTEST_BALANCE](../SPECS/FEATURES/007-URLTEST_BALANCE/FEATURE.md); правила самовосстановления —
+[SPEC 138](../SPECS/TASKS/138-URLTEST_RR_SKIP_DEAD_SLOT/SPEC.md).
 
 ---
 
@@ -342,8 +363,10 @@ SNI по умолчанию — `www.cloudflare.com`, сервер провер�
 | `GetPoolState(groupTag)` | то же плюс сдвинутые ключи, проблемы в адресе и заморозка |
 | `GetDNSGroups()` | живое состояние каждого DNS-сервера `group` |
 | `GetRunningConfig()` | канонический JSON работающего конфига |
+| `GetEffectiveConfig()` | тот же конфиг после lx-предобработки: хопы цепочек добавлены, `detour` перехваченных узлов переписан, MTU выровнен |
+| `GetOutboundConfig(tag)` | один узел как написан, как собран и список изменений между ними |
 | `SubscribeDNSQueries(includeAnswers, handler)` | живой поток DNS-запросов |
-| `GetChains()` | состояние каждого outbound `chain` по позициям |
+| `GetChainStatus(tag)` | состояние одного outbound `chain` по позициям |
 | `SetEndpointEnabled(tag, enabled)` | выключает и включает WG/AWG-endpoint на ходу |
 
 У соединений в потоке есть поле `detourList` — путь через `detour` до финального outbound.
@@ -361,7 +384,8 @@ sing-box api group pool auto     # пул round_robin группы auto (сбо�
 Релей, который читает SNI из ClientHello и отправляет соединение на это имя (Xray `sniffing` с
 `destOverride` без `routeOnly`), уводит узел с маскировочным SNI (REALITY, WARP) на чужой хост.
 Разрезанный ClientHello такой релей не разбирает. Без блока `lx.sniff_guard` ядро режет ClientHello
-как апстрим — только у узлов с `fragment` или `record_fragment`. Блок включает защиту для путей
+как апстрим — только у узлов с `fragment` или `record_fragment`; под `detour` без сокета ядра снизу
+`fragment` узла по умолчанию снимает `lx.detour.strip`, `record_fragment` остаётся. Блок включает защиту для путей
 через релеи и учится по исходам подключений; его ключи — в [§13](#13-корневой-блок-lx).
 
 ```json
@@ -376,19 +400,20 @@ sing-box api group pool auto     # пул round_robin группы auto (сбо�
 ## 10. Outbound `chain` — виртуальная цепочка хопов из групп и узлов
 
 Outbound `chain` строит многохоповый путь из существующих узлов и групп. Каждую позицию
-выбирает своя группа со всей своей логикой, цепочка идёт за выбором. Узел на позиции ≥ 1 работает
-через своё звено — экземпляр, который дозванивается до своего сервера через предыдущую позицию.
-Звенья создаются при первом использовании и удаляются после `idle_timeout` без соединений. MTU
-звеньев выравнивается сам, односторонние DPI-приёмы на внутренних позициях снимаются. Нужен
-build-тег `with_lx_chain` (есть в десктопных `LX_TAGS` и в AAR).
+выбирает своя группа со всей своей логикой, цепочка идёт за выбором. При загрузке конфига каждый
+узел, до которого доходит позиция ≥ 1, включая членов групп, получает `detour` на хоп позиции ниже,
+`<tag>#<i−1>`, — внутренний исходящий типа `chain-hop`; собственный `detour` узла перекрывается. У
+узла один экземпляр и один путь, и группа на позиции проверяет те экземпляры, что несут её трафик.
+Выравнивание MTU и фильтры strip из `lx.detour` действуют на эти узлы как на любой узел под
+`detour`. Нужен build-тег `with_lx_chain` (есть в десктопных `LX_TAGS` и в AAR).
 
 | Ключ | По умолчанию | Что задаёт |
 |------|--------------|------------|
 | `outbounds` | обязательное | теги позиций в порядке пакета, от клиента к выходу; не меньше двух, все разные |
-| `idle_timeout` | `5m` | через сколько удаляется звено без живых соединений; `0` — жить до остановки |
-| `strip_evasion` | `true` | снимать у звеньев на позициях ≥ 1 односторонние приёмы против DPI |
-| `strip` | `{}` | поправки к списку снимаемого: `false` — оставить, `true` — снимать дополнительно |
-| `rewrite` | `{}` | merge-patch к конфигу звеньев по типу узла на позициях ≥ 1 |
+| `rewrite` | `{}` | merge-patch к конфигу перехваченных узлов по типу узла на позициях ≥ 1; `detour` менять нельзя |
+| `interrupt_exist_connections` | `false` | при переключении позиции рвать и пользовательские соединения через цепочку |
+
+`idle_timeout`, `strip_evasion` и `strip` в цепочке валят загрузку и называют замену.
 
 ```jsonc
 {
@@ -399,7 +424,7 @@ build-тег `with_lx_chain` (есть в десктопных `LX_TAGS` и в A
 }
 ```
 
-Каталог снимаемого, MTU звеньев, наблюдаемость и границы — в [lx-chain.ru.md](lx-chain.ru.md).
+Как работают хопы, ошибки загрузки, выключение позиций, наблюдаемость и границы — в [lx-chain.ru.md](lx-chain.ru.md).
 
 ---
 
@@ -468,7 +493,10 @@ windows/386. Остальные фичи в нём без изменений.
 | `wg.connected_socket` | `false` | подключать сокет туннеля к адресу сервера; Linux и Android |
 | `masque.idle_timeout` | выкл | общее окно сна для узлов `masque` без своего `idle_timeout` |
 | `trusttunnel.idle_timeout` | `5m` | общее окно простоя для узлов `trusttunnel` без своего `idle_timeout` |
-| `mtu_align` | `clamp` | подгонка MTU и размера пакета узлов над туннелями: `off`, `fill`, `clamp`; объект `{mode, except}` исключает теги |
+| `detour` | `true` | что ядро делает с узлом под `detour`: `true` — выравнивание MTU `clamp` и все фильтры strip, `false` — поведение апстрима, или объект |
+| `detour.mtu_align` | `clamp` | подгонка MTU и размера пакета узлов над туннелями: `off`, `fill`, `clamp` |
+| `detour.strip` | все фильтры | фильтры для узла без сокета ядра снизу: `true`, `false` или `{filters: {tls: {fragment, spoof, kernel, engine}}}`; объект фильтров заменяет каталог |
+| `detour.except_outbounds` | нет | теги, которые не выравниваются и не фильтруются |
 | `sniff_guard.nodes.sni_mismatch` | `true` | защищать только узлы, у которых SNI не совпадает с `server` |
 | `sniff_guard.nodes.outbound_type` | все типы | защищать только узлы этих типов |
 | `sniff_guard.detour_type` | `direct`, `ssh`, `socks` — `clean`, остальные — `suspect` | стартовая оценка пути по типу релея: `never`, `clean`, `suspect` |
@@ -483,7 +511,7 @@ windows/386. Остальные фичи в нём без изменений.
 "lx": {
   "wg": { "idle": { "suspend": "30s", "suspend_reachable": "5m" } },
   "masque": { "idle_timeout": "5m" },
-  "mtu_align": "clamp",
+  "detour": { "mtu_align": "clamp", "strip": true },
   "sniff_guard": {
     "tls":  { "method": "record_fragment" },
     "quic": { "method": "decoy_first_byte" }
@@ -511,3 +539,54 @@ windows/386. Остальные фичи в нём без изменений.
 ```
 
 С `true` узел не принимает файлы: отправитель получает ошибку 403 `Taildrop is disabled on this node`. Отправка с узла тоже отвергается, в статусе `canShareFiles = false`. Файлы, полученные раньше, остаются в `taildrop_directory`, их можно открыть и удалить. Другие устройства tailnet всё равно видят узел получателем: это задаёт админка Tailscale, а не узел.
+
+---
+
+## 15. Outbound `impair` — ухудшение линии для испытаний
+
+Outbound `impair` намеренно ухудшает соединения, которые через него идут: узкое место с очередью,
+задержка и её разброс, потери сериями, скачки скорости, остановки и обрывы по расписанию — для
+всех соединений или только для части.
+Соединяется он как `direct` или через свой `detour`, в обе стороны с одного конца, без root и netem.
+Нужен, чтобы проверять балансировку, failover и цепочки на настоящих серверах под плохой линией.
+Build-тег `with_lx_impair` есть в десктопных `LX_TAGS` и в AAR; пока в конфиге нет
+`"type": "impair"`, он ничего не делает. При старте `impair` пишет в лог предупреждение, что линия
+ухудшается намеренно.
+
+Ключи outbound'а кроме ключей соединения `direct`:
+
+| Ключ | По умолчанию | Что задаёт |
+|------|--------------|------------|
+| `link_params` | без ухудшения | линия outbound'а: все ключи линии лежат здесь |
+| `sublinks` | нет | вторая ступень для подошедших соединений: один сайт, порт, доля потоков |
+| `schedule`, `schedule_repeat` | нет | изменения линии и подлиний по времени; длина повторяющегося круга |
+| `start` | `process` | от чего отсчитывается расписание: старт процесса или первый трафик (`first_use`) |
+| `seed` | случайное | зерно: одинаковое даёт те же потери и скачки |
+
+`link_params` — один и тот же объект у outbound'а, в подлинии, в записи расписания, в `impair set` и
+в профиле:
+
+| Ключ | По умолчанию | Что задаёт |
+|------|--------------|------------|
+| `profile` | нет | шаблон: `dsl`, `lte-walk`, `wifi-lossy` или имя из `lx.impair_profiles`; остальные ключи его подстраивают |
+| `rate`, `queue` | без ограничения, `"50ms"` | скорость узкого места (`"10mbit"`) и очередь перед ним (время или размер) |
+| `delay`, `jitter` | `0` | добавочная задержка в одну сторону и её разброс |
+| `loss`, `loss_burst` | `0`, `1` | доля потерь (`"0.5%"`) и средняя длина серии потерь |
+| `vary`, `stall` | нет | скачки скорости и случайные остановки линии; `false` выключает их |
+| `outage`, `reset` | `false` | линия молча пропадает; `reset` рвёт соединения (только расписание, `impair set`, подлиния) |
+| `up`, `down` | — | те же ключи для одного направления |
+
+Основное положение — под прокси-узлом: прокси ссылается на `impair` своим `detour`, и ухудшается
+дорога до сервера прокси.
+
+```jsonc
+{"type": "vless", "tag": "via-se", "server": "se.example.net", "server_port": 443, "detour": "slow-se" /* … */},
+{"type": "impair", "tag": "slow-se", "seed": 1, "link_params": {"rate": "10mbit", "delay": "20ms", "loss": "0.5%"}}
+```
+
+Линия меняется на лету командами `sing-box api impair set|schedule|status` и соответствующими
+командами gRPC.
+
+Все ключи с диапазонами, подлинии, расписание, профили, управление на лету, как ухудшаются
+датаграммы и потоки, ошибки и рецепты для испытаний `round_robin` и `failover` — в
+[lx-impair.ru.md](lx-impair.ru.md).

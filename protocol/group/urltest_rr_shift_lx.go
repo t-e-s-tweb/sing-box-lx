@@ -608,8 +608,8 @@ func (b *balancer) rrCountFail(tag string, key rrKey) rrQuarantineVerdict {
 	}
 	others := make([]float64, 0, len(slots))
 	for _, entry := range slots {
-		if entry.tag == tag || entry.tag == "" || b.isQuarantined(entry.tag) {
-			continue // Q2: the median of the pool, quarantined nodes out of it
+		if entry.tag == tag || entry.tag == "" || b.isQuarantined(entry.tag) || b.rr != nil && !b.rr.slotAlive(entry.tag) {
+			continue // Q2: the median over P, the nodes of the pool: no quarantined node, no node without history (§4.2)
 		}
 		if other, counts := m.share(entry.tag); counts {
 			others = append(others, other)
@@ -640,24 +640,9 @@ func (m *rrMemory) quarantineLocked(tag string) {
 	delete(m.counts, tag) // the counters of the node start from zero
 }
 
-// rrDropStruck empties, in the plan of the scheduled run, the slots of the nodes
-// struck out (D1) since the run started (§5): the run puts none of them back, its
-// slot stays empty and asks for the replacement search.
-func (b *balancer) rrDropStruck(tags []string) []string {
-	m := &b.memory
-	m.access.Lock()
-	defer m.access.Unlock()
-	for i, tag := range tags {
-		if tag != "" && m.strikes[tag] > 0 {
-			tags[i] = ""
-		}
-	}
-	return tags
-}
-
-// rrScheduledRun is the scheduled run: the marks and the quarantine lift
-// (rrResetMarks) and strikes(n) of Q4 start from zero. It returns the nodes lifted
-// from quarantine: the run probes them (§8 item 19).
+// rrScheduledRun is what the scheduled run does to the memory at its first answer
+// (rrRunAnswered): the marks and the quarantine lift (rrResetMarks) and strikes(n)
+// of Q4 start from zero. It returns the nodes lifted from quarantine.
 func (b *balancer) rrScheduledRun() []string {
 	lifted := b.rrResetMarks()
 	m := &b.memory
@@ -755,6 +740,7 @@ func (b *balancer) rrStrikeOut(tag string, others bool) bool {
 	}
 	m.access.Unlock()
 	m.k2.forget(tag)
+	b.rrRunStrike(tag) // SPEC 019 — the scheduled run in flight puts it into no slot
 	return quarantined
 }
 
